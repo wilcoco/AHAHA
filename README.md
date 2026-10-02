@@ -4,6 +4,11 @@ A human-first publishing layer for people who think with AI.
 
 Users keep using their own ChatGPT, Claude, Cursor, Codex, or another MCP-capable client. This service does **not** call an LLM. It stores private drafts, publishes selected explorations, preserves optional source messages, and keeps a creator identity across AI providers.
 
+## Live
+
+- Web: https://exploration-web-production.up.railway.app
+- Remote MCP: https://exploration-web-production.up.railway.app/mcp
+
 ## Core object
 
 An **Exploration** contains:
@@ -36,12 +41,10 @@ Public pages show the human thinking first. Raw AI dialogue is secondary source 
 - `search_public_explorations`
 - `get_creator_context`
 
-Supports MCP 2026-07-28 stateless discovery/tool calls and a backwards-compatible initialize flow for older clients.
-
 ## Authentication
 
 Create a creator at `/me`. The site shows:
-- MCP URL: `https://YOUR_DOMAIN/mcp`
+- MCP URL: `https://exploration-web-production.up.railway.app/mcp`
 - Bearer token: `exp_...`
 
 Use the token as `Authorization: Bearer exp_...`.
@@ -67,7 +70,8 @@ Required variables:
 ```
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 NODE_ENV=production
-PUBLIC_BASE_URL=https://YOUR_DOMAIN
+PORT=3000
+PUBLIC_BASE_URL=https://exploration-web-production.up.railway.app
 ```
 
 The app initializes the schema and three demo explorations automatically.
@@ -78,4 +82,4 @@ MVP only. Before broad public launch add OAuth-based MCP authorization, token ro
 
 ## Stack
 
-Node.js 22 + TypeScript + PostgreSQL + server-rendered HTML/CSS.
+Node.js + TypeScript + PostgreSQL + server-rendered HTML/CSS + Railway.
