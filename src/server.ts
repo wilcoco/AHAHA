@@ -223,12 +223,15 @@ async function mcp(req:http.IncomingMessage,res:http.ServerResponse,origin:strin
   if(!u) return json(res,401,{error:"valid Bearer token required"},{"www-authenticate":'Bearer realm="exploration-pub"'});
   let rpc:any; try{rpc=JSON.parse(await body(req))}catch{return json(res,400,{jsonrpc:"2.0",id:null,error:{code:-32700,message:"Parse error"}})}
   const id=rpc.id??null;
-  if(rpc.method==="initialize") return json(res,200,{jsonrpc:"2.0",id,result:{protocolVersion:rpc.params?.protocolVersion||"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"exploration-pub",version:"0.1.0"}}});
-  if(rpc.method==="notifications/initialized") return json(res,202,{});
-  if(rpc.method==="tools/list") return json(res,200,{jsonrpc:"2.0",id,result:{tools:toolDefs()}});
-  if(rpc.method==="tools/call"){
+  const method=rpc.method || String(req.headers["mcp-method"]||"");
+  if(method==="initialize") return json(res,200,{jsonrpc:"2.0",id,result:{protocolVersion:rpc.params?.protocolVersion||"2025-11-25",capabilities:{tools:{}},serverInfo:{name:"exploration-pub",version:"0.1.0"}}});
+  if(method==="server/discover") return json(res,200,{jsonrpc:"2.0",id,result:{protocolVersion:"2026-07-28",capabilities:{tools:{listChanged:false}},serverInfo:{name:"exploration-pub",version:"0.1.0"}}});
+  if(method==="notifications/initialized") return json(res,202,{});
+  if(method==="tools/list") return json(res,200,{jsonrpc:"2.0",id,result:{tools:toolDefs()}});
+  if(method==="tools/call"){
     try{
-      const data=await callTool(rpc.params?.name,rpc.params?.arguments||{},u,origin);
+      const toolName=rpc.params?.name || String(req.headers["mcp-name"]||"");
+      const data=await callTool(toolName,rpc.params?.arguments||{},u,origin);
       return json(res,200,{jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify(data,null,2)}],structuredContent:{result:data}}});
     }catch(e:any){return json(res,200,{jsonrpc:"2.0",id,result:{isError:true,content:[{type:"text",text:e.message||"Tool failed"}]}})}
   }
