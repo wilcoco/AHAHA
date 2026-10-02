@@ -1,0 +1,272 @@
+import http from "node:http";
+import crypto from "node:crypto";
+import pg from "pg";
+
+const { Pool } = pg;
+const PORT = Number(process.env.PORT || 3000);
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined
+});
+
+const q = (text: string, params: any[] = []) => pool.query(text, params);
+const hash = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+const token = () => "exp_" + crypto.randomBytes(24).toString("base64url");
+const esc = (s: any) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[c]!));
+const slugify = (s: string) => s.normalize("NFKD").toLowerCase().replace(/[^a-z0-9\u3131-\uD79D]+/g,"-").replace(/^-+|-+$/g,"").slice(0,64) || ("exploration-" + Date.now());
+
+async function initDb() {
+  await q(`
+  CREATE TABLE IF NOT EXISTS users(
+    id uuid PRIMARY KEY,
+    username text UNIQUE NOT NULL,
+    display_name text NOT NULL,
+    bio text,
+    token_hash text UNIQUE NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE TABLE IF NOT EXISTS explorations(
+    id uuid PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    slug text NOT NULL,
+    title text NOT NULL,
+    opening_question text NOT NULL DEFAULT '',
+    starting_view text NOT NULL DEFAULT '',
+    key_turns jsonb NOT NULL DEFAULT '[]',
+    turning_points jsonb NOT NULL DEFAULT '[]',
+    current_view text NOT NULL DEFAULT '',
+    source_platform text,
+    source_model text,
+    status text NOT NULL DEFAULT 'draft',
+    published_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(user_id, slug)
+  );
+  CREATE TABLE IF NOT EXISTS source_messages(
+    id uuid PRIMARY KEY,
+    exploration_id uuid NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    position int NOT NULL,
+    role text NOT NULL,
+    content text NOT NULL,
+    UNIQUE(exploration_id, position)
+  );
+  CREATE TABLE IF NOT EXISTS follows(
+    follower_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    followee_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY(follower_id, followee_id)
+  );
+  CREATE INDEX IF NOT EXISTS explorations_pub_idx ON explorations(status,published_at DESC);
+  `);
+
+  const found = await q("SELECT 1 FROM users WHERE username='explorer'");
+  if (!found.rowCount) {
+    const uid = crypto.randomUUID();
+    await q("INSERT INTO users(id,username,display_name,bio,token_hash) VALUES($1,'explorer','Explorer','Demo creator showing the Exploration format.',$2)", [uid, hash(crypto.randomBytes(20).toString("hex"))]);
+    const demos = [
+      ["ai-dialogue-as-publishing","Can an AI dialogue become a new kind of blog?","If people increasingly think with AI, what becomes the publishable artifact?","I first assumed the conversation itself could simply be shared as content.",["Compared raw chat sharing with traditional blogging.","Looked at prompt libraries and conversation repositories."],["Raw AI conversations become repetitive quickly; the human context is what makes them worth reading."],"Publish the human question, judgment and change of mind first; keep the full AI conversation as source material."],
+      ["mcp-as-ingestion-layer","Use MCP as the ingestion layer, not as the product","Can creators keep using their own AI without us paying inference costs?","I thought the service might need its own chat interface and LLM API.",["Separated model inference from publishing.","Mapped Remote MCP to storage and publishing tools."],["The model can remain replaceable while creator identity and published thinking stay persistent."],"Let the user keep their AI. Our product owns the publishing identity, continuity and social graph—not the model."],
+      ["thought-git-history","A Git history for how a person changes their mind","What is more valuable than a chronological list of posts?","A creator page looked like enough: profile plus a list of conversations.",["Connected related explorations over time.","Distinguished editing a post from evolving a belief."],["A sequence of changing views can become a durable creator asset across AI providers."],"The long-term object is not a chat archive. It is a public history of how a person explores, revises and connects ideas."]
+    ];
+    for (const d of demos) {
+      await q(`INSERT INTO explorations(id,user_id,slug,title,opening_question,starting_view,key_turns,turning_points,current_view,source_platform,source_model,status,published_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,'demo','none','published',now())`,
+        [crypto.randomUUID(),uid,d[0],d[1],d[2],d[3],JSON.stringify(d[4]),JSON.stringify(d[5]),d[6]]);
+    }
+  }
+}
+
+async function userByToken(t: string) {
+  if (!t) return null;
+  const r = await q("SELECT id,username,display_name,bio FROM users WHERE token_hash=$1 LIMIT 1",[hash(t)]);
+  return r.rows[0] || null;
+}
+
+async function createExploration(userId: string, a: any) {
+  if (!a?.title) throw new Error("title is required");
+  const id = crypto.randomUUID();
+  let slug = slugify(a.title);
+  const exists = await q("SELECT 1 FROM explorations WHERE user_id=$1 AND slug=$2",[userId,slug]);
+  if (exists.rowCount) slug += "-" + crypto.randomBytes(3).toString("hex");
+
+  await q("BEGIN");
+  try {
+    await q(`INSERT INTO explorations(id,user_id,slug,title,opening_question,starting_view,key_turns,turning_points,current_view,source_platform,source_model,status)
+      VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,'draft')`,
+      [id,userId,slug,a.title,a.opening_question||"",a.starting_view||"",JSON.stringify(a.key_turns||[]),JSON.stringify(a.turning_points||[]),a.current_view||"",a.source_platform||null,a.source_model||null]);
+    if (Array.isArray(a.source_messages)) {
+      for (let i=0;i<a.source_messages.length;i++) {
+        const m=a.source_messages[i];
+        await q("INSERT INTO source_messages(id,exploration_id,position,role,content) VALUES($1,$2,$3,$4,$5)",[crypto.randomUUID(),id,i,m.role||"other",String(m.content||"")]);
+      }
+    }
+    await q("COMMIT");
+  } catch(e) { await q("ROLLBACK"); throw e; }
+  return getMine(userId,id);
+}
+
+async function getMine(userId: string, idOrSlug: string) {
+  const r = await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id
+    WHERE e.user_id=$1 AND (e.id::text=$2 OR e.slug=$2) LIMIT 1`,[userId,idOrSlug]);
+  return r.rows[0]||null;
+}
+
+async function listMine(userId: string) {
+  const r = await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id
+    WHERE e.user_id=$1 ORDER BY e.updated_at DESC LIMIT 50`,[userId]);
+  return r.rows;
+}
+
+async function searchMine(userId: string, term: string) {
+  const r = await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id
+    WHERE e.user_id=$1 AND (e.title ILIKE $2 OR e.opening_question ILIKE $2 OR e.current_view ILIKE $2)
+    ORDER BY e.updated_at DESC LIMIT 20`,[userId,"%"+term+"%"]);
+  return r.rows;
+}
+
+async function searchPublic(term: string) {
+  const r = await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id
+    WHERE e.status='published' AND (e.title ILIKE $1 OR e.opening_question ILIKE $1 OR e.current_view ILIKE $1)
+    ORDER BY e.published_at DESC LIMIT 20`,["%"+term+"%"]);
+  return r.rows;
+}
+
+async function appendExploration(userId: string, a: any) {
+  const item = await getMine(userId,a.id_or_slug);
+  if (!item) throw new Error("exploration not found");
+  const turns=[...(item.key_turns||[]),...(a.key_turns||[])];
+  const points=[...(item.turning_points||[]),...(a.turning_points||[])];
+  await q("UPDATE explorations SET key_turns=$1::jsonb,turning_points=$2::jsonb,current_view=COALESCE($3,current_view),updated_at=now() WHERE id=$4",
+    [JSON.stringify(turns),JSON.stringify(points),a.current_view??null,item.id]);
+  if (Array.isArray(a.source_messages) && a.source_messages.length) {
+    const r=await q("SELECT COALESCE(MAX(position),-1)+1 n FROM source_messages WHERE exploration_id=$1",[item.id]);
+    let p=Number(r.rows[0].n);
+    for (const m of a.source_messages) {
+      await q("INSERT INTO source_messages(id,exploration_id,position,role,content) VALUES($1,$2,$3,$4,$5)",
+        [crypto.randomUUID(),item.id,p++,m.role||"other",String(m.content||"")]);
+    }
+  }
+  return getMine(userId,item.id);
+}
+
+async function publishExploration(userId: string, a: any, origin: string) {
+  const item = await getMine(userId,a.id_or_slug);
+  if (!item) throw new Error("exploration not found");
+  await q(`UPDATE explorations SET title=COALESCE($1,title),opening_question=COALESCE($2,opening_question),
+    starting_view=COALESCE($3,starting_view),current_view=COALESCE($4,current_view),status='published',
+    published_at=COALESCE(published_at,now()),updated_at=now() WHERE id=$5`,
+    [a.title??null,a.opening_question??null,a.starting_view??null,a.current_view??null,item.id]);
+  const now=await getMine(userId,item.id);
+  return {...now,public_url: origin+"/@"+now.username+"/"+now.slug};
+}
+
+async function sourceMessages(explorationId:string) {
+  return (await q("SELECT position,role,content FROM source_messages WHERE exploration_id=$1 ORDER BY position",[explorationId])).rows;
+}
+
+function toolDefs() {
+  const msg = {type:"object",properties:{role:{type:"string"},content:{type:"string"}},required:["content"]};
+  return [
+    {name:"create_exploration",description:"Create a PRIVATE draft exploration from the current AI-assisted thinking. Capture the human question, starting view, key turns, turning points and current view. Do not publish automatically.",inputSchema:{type:"object",properties:{title:{type:"string"},opening_question:{type:"string"},starting_view:{type:"string"},key_turns:{type:"array",items:{type:"string"}},turning_points:{type:"array",items:{type:"string"}},current_view:{type:"string"},source_platform:{type:"string"},source_model:{type:"string"},source_messages:{type:"array",items:msg}},required:["title"]}},
+    {name:"append_exploration",description:"Append new turns or a changed view to an existing private or published exploration.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"},key_turns:{type:"array",items:{type:"string"}},turning_points:{type:"array",items:{type:"string"}},current_view:{type:"string"},source_messages:{type:"array",items:msg}},required:["id_or_slug"]}},
+    {name:"publish_exploration",description:"Make an exploration PUBLIC. Call only after the user explicitly asks to publish or share publicly.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"},title:{type:"string"},opening_question:{type:"string"},starting_view:{type:"string"},current_view:{type:"string"}},required:["id_or_slug"]}},
+    {name:"get_exploration",description:"Get one of the authenticated creator's explorations and its optional source conversation.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"}},required:["id_or_slug"]}},
+    {name:"list_my_explorations",description:"List the authenticated creator's recent drafts and published explorations.",inputSchema:{type:"object",properties:{}}},
+    {name:"search_my_explorations",description:"Search the authenticated creator's own exploration history.",inputSchema:{type:"object",properties:{query:{type:"string"}},required:["query"]}},
+    {name:"search_public_explorations",description:"Search public explorations from all creators.",inputSchema:{type:"object",properties:{query:{type:"string"}},required:["query"]}},
+    {name:"get_creator_context",description:"Return a compact cross-AI history of how the creator has explored a topic over time.",inputSchema:{type:"object",properties:{query:{type:"string"}}}}
+  ];
+}
+
+async function callTool(name:string,a:any,user:any,origin:string){
+  if(name==="create_exploration") return createExploration(user.id,a);
+  if(name==="append_exploration") return appendExploration(user.id,a);
+  if(name==="publish_exploration") return publishExploration(user.id,a,origin);
+  if(name==="get_exploration"){const e=await getMine(user.id,a.id_or_slug); if(!e) throw new Error("exploration not found"); return {exploration:e,source_messages:await sourceMessages(e.id)}}
+  if(name==="list_my_explorations") return {explorations:await listMine(user.id)};
+  if(name==="search_my_explorations") return {explorations:await searchMine(user.id,a.query||"")};
+  if(name==="search_public_explorations") return {explorations:await searchPublic(a.query||"")};
+  if(name==="get_creator_context"){const items=a.query?await searchMine(user.id,a.query):await listMine(user.id); return {creator:user,history:items.slice(0,12).map((e:any)=>({date:e.published_at||e.updated_at,title:e.title,question:e.opening_question,current_view:e.current_view,status:e.status,slug:e.slug}))};}
+  throw new Error("unknown tool");
+}
+
+function json(res:http.ServerResponse,status:number,data:any,headers:any={}) {
+  res.writeHead(status,{"content-type":"application/json; charset=utf-8","cache-control":"no-store",...headers});
+  res.end(JSON.stringify(data));
+}
+function html(res:http.ServerResponse,status:number,body:string){
+  res.writeHead(status,{"content-type":"text/html; charset=utf-8","cache-control":"no-store"});
+  res.end(body);
+}
+function shell(title:string,body:string,me=false){
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · Exploration</title>
+  <style>:root{--bg:#f7f6f1;--paper:#fffef9;--ink:#171714;--muted:#686860;--line:#deddd5;--accent:#224c3d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.62 Georgia,serif}a{color:inherit}.wrap{max-width:850px;margin:auto;padding:0 24px}.top{height:72px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font-family:system-ui}.brand{text-decoration:none;font-weight:800}.nav a{margin-left:18px;text-decoration:none;color:var(--muted);font-size:14px}.hero{padding:68px 0 42px}.hero h1{font-size:clamp(38px,7vw,70px);line-height:1.02;letter-spacing:-.045em;margin:0 0 24px}.kicker{font:800 12px system-ui;text-transform:uppercase;letter-spacing:.14em;color:var(--accent)}.lede{font-size:21px;color:#3d3d37}.card{display:block;background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:26px;margin:0 0 16px;text-decoration:none}.card h2{font-size:27px;line-height:1.15;margin:8px 0 12px}.meta{font:13px system-ui;color:var(--muted)}.section{padding:28px 0;border-top:1px solid var(--line)}.section h3{font:800 12px system-ui;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);margin:0 0 13px}.section p{font-size:21px;white-space:pre-wrap}.profile{padding:54px 0 26px}.profile h1{font-size:46px;margin:0}.panel{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:24px;margin:20px 0}.form{display:grid;gap:12px}.form input{padding:12px;border:1px solid var(--line);border-radius:9px}.btn{border:0;border-radius:9px;background:var(--ink);color:white;padding:11px 16px;font-weight:700}.secret{overflow-wrap:anywhere;background:#171714;color:white;padding:14px;border-radius:9px}details{border-top:1px solid var(--line);padding:22px 0}.msg{padding:14px 0;border-bottom:1px solid var(--line)}.role{font:800 11px system-ui;text-transform:uppercase;color:var(--muted)}.footer{padding:60px 0;color:var(--muted);font:13px system-ui}</style></head><body><div class="wrap"><header class="top"><a class="brand" href="/">Exploration</a><nav class="nav"><a href="/">Feed</a><a href="/me">${me?"My explorations":"Create / Sign in"}</a></nav></header>${body}<footer class="footer">Think with any AI. Publish the human thinking.</footer></div></body></html>`;
+}
+function card(e:any){return `<a class="card" href="/@${encodeURIComponent(e.username)}/${encodeURIComponent(e.slug)}"><div class="meta">@${esc(e.username)} · ${esc(e.source_platform||"AI-assisted")}</div><h2>${esc(e.title)}</h2><div>${esc(e.opening_question)}</div></a>`;}
+function feed(items:any[]){return shell("Feed",`<section class="hero"><div class="kicker">AI-era publishing</div><h1>Follow how people think, not just what AI answers.</h1><p class="lede">Explorations capture the question, the starting view, the turning points and where the creator landed. The source conversation stays underneath.</p></section>${items.map(card).join("")}`);}
+function auth(err=""){return shell("Create or sign in",`<section class="hero"><div class="kicker">Creator access</div><h1>Keep your AI. Own your exploration history.</h1></section>${err?'<div class="panel"><b>'+esc(err)+'</b></div>':""}<div class="panel"><h2>Create creator</h2><form class="form" method="post" action="/register"><input name="username" placeholder="username" required><input name="display_name" placeholder="Display name" required><button class="btn">Create</button></form></div><div class="panel"><h2>Sign in with creator token</h2><form class="form" method="post" action="/login"><input type="password" name="token" placeholder="exp_..." required><button class="btn">Sign in</button></form></div>`);}
+function mePage(u:any,items:any[],t:string,origin:string){return shell("My explorations",`<section class="profile"><div class="kicker">Creator</div><h1>${esc(u.display_name)}</h1><div class="meta">@${esc(u.username)}</div></section><div class="panel"><h2>Remote MCP</h2><p>Endpoint</p><div class="secret"><code>${esc(origin)}/mcp</code></div><p>Bearer token</p><div class="secret"><code>${esc(t)}</code></div><p class="meta">The server never calls an LLM. Your AI performs reasoning and invokes these tools.</p></div><div class="panel"><h2>Try this</h2><p>“Create a private exploration from our current discussion. Capture my starting view, key turns, turning points and current view.”</p><p>Then: “Publish that exploration.”</p></div><h2>My explorations</h2>${items.map((e:any)=>'<div class="card"><div class="meta">'+esc(e.status)+'</div><h2>'+esc(e.title)+'</h2><div>'+esc(e.current_view)+'</div></div>').join("")}`,true);}
+function explorationPage(e:any,msgs:any[]){return shell(e.title,`<article><section class="hero"><div class="kicker">Exploration by <a href="/@${esc(e.username)}">@${esc(e.username)}</a></div><h1>${esc(e.title)}</h1></section><section class="section"><h3>Question</h3><p>${esc(e.opening_question)}</p></section><section class="section"><h3>Starting view</h3><p>${esc(e.starting_view)}</p></section><section class="section"><h3>Key turns</h3><ul>${(e.key_turns||[]).map((x:string)=>'<li>'+esc(x)+'</li>').join("")}</ul></section><section class="section"><h3>Turning points</h3><ul>${(e.turning_points||[]).map((x:string)=>'<li>'+esc(x)+'</li>').join("")}</ul></section><section class="section"><h3>Now I think</h3><p>${esc(e.current_view)}</p></section><details><summary>Read source conversation (${msgs.length} messages)</summary>${msgs.map((m:any)=>'<div class="msg"><div class="role">'+esc(m.role)+'</div><div>'+esc(m.content)+'</div></div>').join("")||'<p>No source messages stored.</p>'}</details></article>`);}
+
+function cookies(req:http.IncomingMessage){const o:any={};for(const p of (req.headers.cookie||"").split(";")){const i=p.indexOf("=");if(i>0)o[p.slice(0,i).trim()]=decodeURIComponent(p.slice(i+1));}return o;}
+async function body(req:http.IncomingMessage){const chunks:any[]=[];let n=0;for await(const c of req){n+=c.length;if(n>2000000)throw new Error("body too large");chunks.push(c)}return Buffer.concat(chunks).toString("utf8");}
+function redirect(res:http.ServerResponse,loc:string,cookie?:string){res.writeHead(303,{location:loc,...(cookie?{"set-cookie":cookie}:{})});res.end();}
+function sessionCookie(t:string){return "exploration_session="+encodeURIComponent(t)+"; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"+(process.env.NODE_ENV==="production"?"; Secure":"");}
+
+async function mcp(req:http.IncomingMessage,res:http.ServerResponse,origin:string){
+  const auth=req.headers.authorization||"";
+  const u=await userByToken(auth.toLowerCase().startsWith("bearer ")?auth.slice(7).trim():"");
+  if(!u) return json(res,401,{error:"valid Bearer token required"},{"www-authenticate":'Bearer realm="exploration-pub"'});
+  let rpc:any; try{rpc=JSON.parse(await body(req))}catch{return json(res,400,{jsonrpc:"2.0",id:null,error:{code:-32700,message:"Parse error"}})}
+  const id=rpc.id??null;
+  if(rpc.method==="initialize") return json(res,200,{jsonrpc:"2.0",id,result:{protocolVersion:rpc.params?.protocolVersion||"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"exploration-pub",version:"0.1.0"}}});
+  if(rpc.method==="notifications/initialized") return json(res,202,{});
+  if(rpc.method==="tools/list") return json(res,200,{jsonrpc:"2.0",id,result:{tools:toolDefs()}});
+  if(rpc.method==="tools/call"){
+    try{
+      const data=await callTool(rpc.params?.name,rpc.params?.arguments||{},u,origin);
+      return json(res,200,{jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify(data,null,2)}],structuredContent:{result:data}}});
+    }catch(e:any){return json(res,200,{jsonrpc:"2.0",id,result:{isError:true,content:[{type:"text",text:e.message||"Tool failed"}]}})}
+  }
+  return json(res,200,{jsonrpc:"2.0",id,error:{code:-32601,message:"Method not found"}});
+}
+
+const server=http.createServer(async(req,res)=>{
+  try{
+    const origin=(process.env.PUBLIC_BASE_URL||("http://"+(req.headers.host||("localhost:"+PORT)))).replace(/\/$/,"");
+    const url=new URL(req.url||"/",origin);
+    if(url.pathname==="/health"){res.writeHead(200,{"content-type":"text/plain"});return res.end("ok")}
+    if(url.pathname==="/mcp" && req.method==="POST") return mcp(req,res,origin);
+    if(url.pathname==="/" && req.method==="GET"){
+      const r=await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id WHERE e.status='published' ORDER BY e.published_at DESC LIMIT 30`);
+      return html(res,200,feed(r.rows));
+    }
+    if(url.pathname==="/me" && req.method==="GET"){
+      const t=cookies(req).exploration_session||""; const u=await userByToken(t); if(!u)return html(res,200,auth());
+      return html(res,200,mePage(u,await listMine(u.id),t,origin));
+    }
+    if(url.pathname==="/register" && req.method==="POST"){
+      const p=new URLSearchParams(await body(req)); const username=String(p.get("username")||"").trim().toLowerCase(); const display=String(p.get("display_name")||"").trim();
+      if(!/^[a-z0-9_-]{3,32}$/.test(username)) return html(res,400,auth("Username must be 3–32 letters, numbers, _ or -."));
+      const t=token(); try{await q("INSERT INTO users(id,username,display_name,token_hash) VALUES($1,$2,$3,$4)",[crypto.randomUUID(),username,display||username,hash(t)]);}catch{return html(res,400,auth("That username already exists."))}
+      return redirect(res,"/me",sessionCookie(t));
+    }
+    if(url.pathname==="/login" && req.method==="POST"){
+      const p=new URLSearchParams(await body(req)); const t=String(p.get("token")||""); const u=await userByToken(t); if(!u)return html(res,401,auth("Invalid creator token."));
+      return redirect(res,"/me",sessionCookie(t));
+    }
+    if(url.pathname.startsWith("/@") && req.method==="GET"){
+      const parts=url.pathname.split("/").filter(Boolean); const username=decodeURIComponent(parts[0].slice(1));
+      if(parts.length===1){const u=(await q("SELECT id,username,display_name,bio FROM users WHERE username=$1",[username])).rows[0];if(!u)return html(res,404,"Not found");const items=(await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id WHERE u.username=$1 AND e.status='published' ORDER BY e.published_at DESC`,[username])).rows;return html(res,200,shell("@"+username,`<section class="profile"><div class="kicker">Creator</div><h1>${esc(u.display_name)}</h1><div class="meta">@${esc(u.username)}</div><p>${esc(u.bio||"")}</p></section>${items.map(card).join("")}`));}
+      if(parts.length===2){const e=(await q(`SELECT e.*,u.username,u.display_name FROM explorations e JOIN users u ON u.id=e.user_id WHERE u.username=$1 AND e.slug=$2 AND e.status='published' LIMIT 1`,[username,decodeURIComponent(parts[1])])).rows[0];if(!e)return html(res,404,"Not found");return html(res,200,explorationPage(e,await sourceMessages(e.id)));}
+    }
+    return html(res,404,"Not found");
+  }catch(e:any){console.error(e);return html(res,500,process.env.NODE_ENV==="production"?"Internal server error":"<pre>"+esc(e.stack||e.message)+"</pre>")}
+});
+
+await initDb();
+server.listen(PORT,"0.0.0.0",()=>console.log("exploration-pub listening on",PORT));
