@@ -7,7 +7,7 @@ A human-first publishing layer for people who think with AI.
 **Remote MCP:** https://exploration-web-production.up.railway.app/mcp  
 **Repository:** wilcoco/AHAHA (temporary repository name for this MVP)
 
-Users keep using their own Claude, ChatGPT, Cursor, Codex, or another MCP-capable client. This service does **not** call an LLM. It stores private drafts, publishes selected explorations, preserves optional source messages, and keeps a creator identity across AI providers.
+Users can chat in Exploration with a service-provided OpenAI or Anthropic model (Hosted LLM), or save their own provider API key (BYOK). They can also keep using Claude, ChatGPT, Cursor, Codex, or another MCP-capable client through the existing Remote MCP connection. Exploration stores private drafts, publishes selected explorations, preserves optional source messages, and keeps a creator identity across AI providers.
 
 ## Core object
 
@@ -26,7 +26,13 @@ Public pages show the human thinking first. Raw AI dialogue is secondary source 
 - `/` public feed
 - `/@username` creator profile
 - `/@username/:slug` published exploration
-- `/me` creator account / private list
+- `/me` creator account / private list / Hosted provider status / BYOK settings
+- `/chat` signed-in text chat with Hosted LLM or BYOK
+- `POST /api/chat` send conversation messages to the selected provider
+- `GET /api/llm/settings` read provider preference and safe configuration status
+- `PUT /api/llm/settings` save provider preference
+- `PUT /api/llm/keys/openai` and `PUT /api/llm/keys/anthropic` save or replace the signed-in user's API key
+- `DELETE /api/llm/keys/openai` and `DELETE /api/llm/keys/anthropic` remove the signed-in user's API key
 - `/connect/claude` Claude onboarding
 - `/mcp` Remote MCP endpoint
 - `/health` Railway health check
@@ -59,6 +65,30 @@ Access tokens are short-lived (1 hour). Refresh tokens expire after 30 days and 
 Passwords are hashed with Node.js `scrypt`. OAuth and web-session tokens are stored as SHA-256 hashes, not plaintext.
 
 The original `exp_...` bearer-token mechanism remains server-side only for backward compatibility with early MVP sessions; it is no longer exposed in the UI.
+
+Chat and LLM settings APIs require the `exploration_web` browser session created by website sign-in. MCP OAuth access tokens and legacy bearer tokens do not authorize these APIs. Existing Remote MCP/OAuth routes and Exploration tools remain available separately.
+
+## Hosted LLM and BYOK
+
+Sign in at `/me` to see **OpenAI hosted configured / not configured** and **Anthropic hosted configured / not configured**. These indicators describe server configuration; an actual chat request checks whether the provider accepts the key and model. Empty values and placeholders do not enable a Hosted provider.
+
+The account page also lets each user save, replace, or delete their own OpenAI and Anthropic API keys and select a default chat provider. Saved keys are never returned to the browser: the UI shows only whether a key is saved and its last four characters. BYOK keys are encrypted before storage in PostgreSQL with AES-256-GCM, using a fresh nonce and authenticated data bound to the user and provider. `BYOK_MASTER_KEY` supplies the encryption key. If it is missing, a placeholder, or invalid, BYOK storage and use are disabled; Hosted chat and existing Exploration features can still operate.
+
+Available provider values:
+
+| Provider | Credentials used |
+| --- | --- |
+| `hosted_openai` | Service's `HOSTED_OPENAI_API_KEY` |
+| `hosted_anthropic` | Service's `HOSTED_ANTHROPIC_API_KEY` |
+| `byok_openai` | Signed-in user's encrypted OpenAI key |
+| `byok_anthropic` | Signed-in user's encrypted Anthropic key |
+| `auto` | First configured provider in the order below |
+
+`auto` chooses `hosted_openai`, then `hosted_anthropic`, then `byok_openai`, then `byok_anthropic`. If none is configured, the app explains that a provider must be configured before sending a message. Selection is based on configuration, not a promise that an upstream key has valid billing or model access.
+
+Open `/chat`, choose a provider, and send a message. The browser sends conversation messages to `POST /api/chat`; the server calls [OpenAI's Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create) or [Anthropic's Messages API](https://platform.claude.com/docs/en/api/messages/create) and returns the assistant response. API keys remain on the server after saving.
+
+This first chat implementation keeps conversation history in page memory: reloading or leaving the page clears it. Chat messages are not saved as Explorations, and automatic transformation into an Exploration is deferred to a later phase. Existing MCP tools can still create and publish Explorations.
 
 ## Connect Claude
 
@@ -100,7 +130,7 @@ Project: `exploration-pub`
 
 Production service: `exploration-web`
 
-Required variables:
+Keep the existing service variables:
 
 ```
 DATABASE_URL=${{Postgres.DATABASE_URL}}
@@ -109,14 +139,38 @@ PUBLIC_BASE_URL=https://exploration-web-production.up.railway.app
 PORT=3000
 ```
 
-The app initializes the schema and three demo explorations automatically.
+Add these five variables to **`exploration-pub` → `exploration-web` → Variables**:
+
+| Variable | Initial value | Value to supply when enabling the feature |
+| --- | --- | --- |
+| `HOSTED_OPENAI_API_KEY` | Empty | The service owner's OpenAI API key |
+| `HOSTED_OPENAI_MODEL` | `gpt-4.1-mini` | An OpenAI model available to the configured key |
+| `HOSTED_ANTHROPIC_API_KEY` | Empty | The service owner's Anthropic API key |
+| `HOSTED_ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | An Anthropic model available to the configured key |
+| `BYOK_MASTER_KEY` | `REPLACE_WITH_RANDOM_32_BYTE_HEX` | A newly generated cryptographic 32-byte key, encoded as 64 hexadecimal characters or base64 |
+
+Leaving an API key blank keeps that Hosted provider unconfigured. Only one Hosted provider needs a key to use Hosted chat. If Railway requires a nonempty value, use `not-configured` until replacing it with the real API key. Do not use an actual API key as an example or commit it to this repository.
+
+`BYOK_MASTER_KEY` is an application encryption secret, **not** an OpenAI or Anthropic API key. Generate it once in a private local terminal:
+
+```sh
+openssl rand -hex 32
+```
+
+Paste the generated value directly into the Railway variable, save it securely, and apply/deploy the variable changes. Never put the value in source code, chat messages, screenshots, or logs. Keep it stable across deployments and retain it with database backups: changing or losing it makes existing saved BYOK keys unreadable. Key rotation requires an explicit migration; if no migration is performed, users must save their provider keys again after a change.
+
+The model variables select the corresponding provider's model for both Hosted and BYOK calls. Users' BYOK API keys belong in their signed-in `/me` settings, not in shared Railway Hosted variables. An API key must have access to the selected model and API usage enabled for messages to succeed.
+
+`.env.example` lists safe sample configuration values. The app reads its process environment; the example file is not automatically loaded. The app initializes its schema, including LLM preferences and encrypted BYOK storage, and three demo explorations automatically.
+
+After deploying, verify the latest Railway deployment is `SUCCESS`, `/health` returns `ok`, `/chat` loads (or offers sign-in), and `/me` reports the expected provider status. Once real credentials are configured, send a short message through each enabled provider to check inference end to end.
 
 ## Security notes
 
-MVP only. Draft is the default and publishing is a separate tool.
+MVP only. Draft is the default and publishing is a separate tool. New chat/settings mutations require a same-origin JSON request (DELETE requires same origin). Chat has a PostgreSQL-backed limit of 20 requests per user per minute, one in-flight request per user per server process, a 45-second provider timeout, and bounded message/output sizes. These limits are not a substitute for service-wide cost controls before public launch.
 
 Before broad public launch, add:
-- production rate limiting
+- service-wide quotas, spending limits, and registration/login rate limiting
 - account recovery / email verification
 - brute-force protection
 - moderation and abuse controls
@@ -125,6 +179,18 @@ Before broad public launch, add:
 - stricter per-tool OAuth scope enforcement
 - a dedicated identity provider or hardened authorization server
 - Connector Directory review / registration
+
+## Development checks
+
+```sh
+npm ci
+npm run typecheck
+npm test
+# Use a disposable local PostgreSQL database for integration/regression tests:
+TEST_DATABASE_URL=postgres://localhost/exploration_test npm test
+```
+
+Provider unit tests use mocked HTTP responses; they do not spend tokens or need real API keys. Integration tests use isolated database schemas and exercise encrypted storage, authorization, chat routing, and the existing OAuth/MCP flow. A real provider inference smoke test is still needed after supplying real API keys.
 
 ## Stack
 
