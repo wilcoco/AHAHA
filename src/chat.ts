@@ -5,6 +5,8 @@ import {
   type ChatProvider, type Provider
 } from "./llm.js";
 
+import type { createWorkspace } from "./workspace.js";
+
 type Query = (text: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number | null }>;
 const selections: ChatProvider[] = ["auto", "hosted_openai", "hosted_anthropic", "byok_openai", "byok_anthropic"];
 
@@ -34,7 +36,7 @@ export async function initChatDb(q: Query) {
   `);
 }
 
-function json(res: ServerResponse, status: number, data: unknown) {
+export function json(res: ServerResponse, status: number, data: unknown) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -50,13 +52,13 @@ function selection(value: unknown): ChatProvider {
   return value as ChatProvider;
 }
 
-function requireSameOrigin(req: IncomingMessage, origin: string) {
+export function requireSameOrigin(req: IncomingMessage, origin: string) {
   if (req.headers.origin !== new URL(origin).origin || req.headers["sec-fetch-site"] === "cross-site") {
     throw new AppError(403, "invalid_origin", "Please submit this request from Exploration.");
   }
 }
 
-async function readJson(req: IncomingMessage, limit: number): Promise<Record<string, unknown>> {
+export async function readJson(req: IncomingMessage, limit: number): Promise<Record<string, unknown>> {
   if (req.headers["content-type"]?.split(";")[0].trim().toLowerCase() !== "application/json") {
     throw new AppError(415, "json_required", "Send an application/json request.");
   }
@@ -86,8 +88,9 @@ async function readJson(req: IncomingMessage, limit: number): Promise<Record<str
   }
 }
 
-export function createChatApi({ q, authenticate, env = process.env, fetchImpl = fetch }: {
+export function createChatApi({ q, authenticate, env = process.env, fetchImpl = fetch, workspace }: {
   q: Query;
+  workspace?: ReturnType<typeof createWorkspace>;
   authenticate: (req: IncomingMessage) => Promise<{ id: string } | null>;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
@@ -108,12 +111,19 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
   }
 
   return async function handleChatApi(req: IncomingMessage, res: ServerResponse, pathname: string, origin: string) {
-    if (pathname !== "/api/chat" && !pathname.startsWith("/api/llm/")) return false;
+    const isWorkspace = pathname.startsWith("/api/conversations") || pathname.startsWith("/api/explorations/");
+    if (pathname !== "/api/chat" && !pathname.startsWith("/api/llm/") && !isWorkspace) return false;
     try {
       // Web sessions only: MCP/OAuth credentials never authorize spending or managing LLM keys.
       const user = await authenticate(req);
       if (!user) throw new AppError(401, "sign_in_required", "Sign in to Exploration to continue.");
       if (req.method !== "GET") requireSameOrigin(req, origin);
+
+      if (isWorkspace) {
+        if (!workspace) throw new AppError(404, "not_found", "Workspace unavailable.");
+        await workspace.api(req,res,new URL(req.url!,origin),user.id,origin);
+        return true;
+      }
 
       if (pathname === "/api/llm/settings" && req.method === "GET") {
         json(res, 200, await settings(user.id));
@@ -140,7 +150,12 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
         }
       } else if (pathname === "/api/chat" && req.method === "POST") {
         const data = await readJson(req, 300000);
-        const messages = validateMessages(data.messages);
+        const prepared = data.conversation_id !== undefined && workspace ? await workspace.prepare(user.id,data) : null;
+        if (prepared?.cached) {
+          json(res,200,{conversation:workspace!.publicConversation(prepared.row),provider:prepared.row.provider,model:prepared.row.model,message:prepared.row.messages.at(-1)});
+          return true;
+        }
+        const messages = validateMessages(prepared ? prepared.messages : data.messages);
         const current = await settings(user.id);
         const requested = data.provider === undefined ? current.provider : selection(data.provider);
         const provider = resolveProvider(requested, {
@@ -149,7 +164,9 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
         }, env);
         if (active.has(user.id)) throw new AppError(429, "chat_in_progress", "Wait for your current response to finish.");
         active.add(user.id);
+        let locked = false;
         try {
+          if (prepared) { await workspace!.begin(user.id,prepared); locked = true; }
           const allowed = await q(`INSERT INTO user_chat_rate_limits(user_id,window_start,requests)
             VALUES($1,date_trunc('minute',now()),1)
             ON CONFLICT(user_id) DO UPDATE SET window_start=EXCLUDED.window_start,
@@ -168,8 +185,13 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
             apiKey = (vendor === "openai" ? env.HOSTED_OPENAI_API_KEY : env.HOSTED_ANTHROPIC_API_KEY)!.trim();
           }
           const result = await callProvider(provider, messages, apiKey, env, fetchImpl);
-          json(res, 200, { provider: result.provider, model: result.model, message: { role: "assistant", content: result.content } });
-        } finally { active.delete(user.id); }
+          const conversation = prepared ? await workspace!.finish(user.id,prepared,result) : undefined;
+          locked = false;
+          json(res, 200, { provider: result.provider, model: result.model, message: { role: "assistant", content: result.content }, ...(conversation ? {conversation} : {}) });
+        } finally {
+          active.delete(user.id);
+          if (locked && prepared) await workspace!.release(user.id,prepared);
+        }
       } else {
         throw new AppError(404, "not_found", "API route not found.");
       }

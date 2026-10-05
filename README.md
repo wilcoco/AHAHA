@@ -27,7 +27,7 @@ Public pages show the human thinking first. Raw AI dialogue is secondary source 
 - `/@username` creator profile
 - `/@username/:slug` published exploration
 - `/me` creator account / private list / Hosted provider status / BYOK settings
-- `/chat` signed-in text chat with Hosted LLM or BYOK
+- `/chat` three-panel exploration workspace: search, saved conversation, thought map
 - `POST /api/chat` send conversation messages to the selected provider
 - `GET /api/llm/settings` read provider preference and safe configuration status
 - `PUT /api/llm/settings` save provider preference
@@ -86,9 +86,25 @@ Available provider values:
 
 `auto` chooses `hosted_openai`, then `hosted_anthropic`, then `byok_openai`, then `byok_anthropic`. If none is configured, the app explains that a provider must be configured before sending a message. Selection is based on configuration, not a promise that an upstream key has valid billing or model access.
 
-Open `/chat`, choose a provider, and send a message. The browser sends conversation messages to `POST /api/chat`; the server calls [OpenAI's Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create) or [Anthropic's Messages API](https://platform.claude.com/docs/en/api/messages/create) and returns the assistant response. API keys remain on the server after saving.
+Open `/chat`, choose a provider, and send a message. The workspace sends a conversation ID, revision, request ID, new message, and selected reference IDs to `POST /api/chat`. The server loads the account-owned history and calls [OpenAI's Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create) or [Anthropic's Messages API](https://platform.claude.com/docs/en/api/messages/create) and returns the assistant response. API keys remain on the server after saving.
 
-This first chat implementation keeps conversation history in page memory: reloading or leaving the page clears it. Chat messages are not saved as Explorations, and automatic transformation into an Exploration is deferred to a later phase. Existing MCP tools can still create and publish Explorations.
+Conversations are stored privately in PostgreSQL after each successful reply, and can be reopened from “Your conversations” or their URL. “New” starts another conversation without deleting the old one. Failed provider calls leave the saved history intact. Revision checks and a database-backed per-conversation lease prevent simultaneous edits/spending; repeating the last successful request ID returns the saved result.
+
+The left panel searches your own drafts/published explorations or the public feed. Read a result before choosing “Use in conversation”. Up to three selected references (title, opening question, and current view) are sent to the chosen model with your next message. Their visibility is checked again on the server. This is keyword search of stored explorations, not live web search.
+
+The right thought map connects selected references to the opening question and subsequent user questions. Nodes open their source or jump to the corresponding message. These are actual recorded questions, not AI-inferred beliefs or a semantic knowledge graph. On tablets the map switches with the conversation; mobile has Search / Conversation / Thought map tabs.
+
+“Reflect & save an exploration” lets the author write their starting view, turning points, and current view. Saving a private draft atomically snapshots those fields and the source conversation. Review the snapshot before pressing “Publish this exploration”, which makes both the reflection and source conversation public. Later conversation edits do not silently change an already-published snapshot. Automatic AI summarization remains a later phase. Existing MCP tools still create and publish explorations through the same core tables.
+
+Workspace APIs (browser session only):
+- `GET/POST /api/conversations` — recent conversations / create private conversation.
+- `GET/PATCH /api/conversations/:id` — restore / save title and reflection using the current revision.
+- `POST /api/conversations/:id/draft` — snapshot a reviewed reflection and transcript privately.
+- `GET /api/explorations/search?scope=public|mine&q=...` — visibility-scoped keyword search.
+- `GET /api/explorations/:id` — read a public or owned exploration.
+- `POST /api/explorations/:id/publish` — explicit owner-only publishing.
+
+The legacy `POST /api/chat` messages-array interface remains available for existing browser clients. Only the conversation-ID flow persists history.
 
 ## Connect Claude
 
@@ -190,7 +206,7 @@ npm test
 TEST_DATABASE_URL=postgres://localhost/exploration_test npm test
 ```
 
-Provider unit tests use mocked HTTP responses; they do not spend tokens or need real API keys. Integration tests use isolated database schemas and exercise encrypted storage, authorization, chat routing, and the existing OAuth/MCP flow. A real provider inference smoke test is still needed after supplying real API keys.
+Provider unit tests use mocked HTTP responses; they do not spend tokens or need real API keys. Integration tests use isolated database schemas and exercise encrypted storage, authorization, chat routing, saved conversation isolation, retry deduplication, reference visibility, draft/publication snapshots, and the existing OAuth/MCP flow. A real provider inference smoke test is still needed after supplying real API keys.
 
 ## Stack
 

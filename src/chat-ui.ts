@@ -2,9 +2,9 @@ const llmStyles = `<style>
 .llm-panel{font-family:system-ui,sans-serif}.llm-panel h2{font-family:Georgia,serif;margin:0 0 8px;font-size:28px}.llm-panel h3{font-size:16px;margin:0 0 8px}.llm-help{font-size:14px;color:var(--muted);margin:8px 0 16px}.llm-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.llm-box{border:1px solid var(--line);border-radius:12px;padding:18px;min-width:0}.llm-status{font-size:14px;overflow-wrap:anywhere}.llm-status[data-configured="true"]{color:var(--accent)}.llm-field{display:grid;gap:7px;font-size:14px;font-weight:600;margin:14px 0}.llm-panel input,.llm-panel select,.llm-panel textarea{width:100%;min-width:0;font:16px/1.5 system-ui,sans-serif;color:var(--ink);background:var(--paper);padding:11px 12px;border:1px solid var(--line);border-radius:9px}.llm-panel input:focus,.llm-panel select:focus,.llm-panel textarea:focus{outline:2px solid var(--accent);outline-offset:2px}.llm-panel button{cursor:pointer}.llm-panel button:disabled,.llm-panel input:disabled,.llm-panel select:disabled{opacity:.55;cursor:not-allowed}.llm-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.llm-secondary{border:1px solid var(--line);border-radius:9px;background:transparent;color:var(--ink);padding:10px 15px;font-weight:600}.llm-notice{font-size:14px;min-height:1.5em;margin:12px 0 0;overflow-wrap:anywhere}.llm-notice[data-error="true"]{color:#973b2f}.llm-divider{border:0;border-top:1px solid var(--line);margin:24px 0}.chat-hero{padding:44px 0 14px}.chat-hero h1{font-size:clamp(40px,7vw,62px);margin:8px 0;line-height:1.1;letter-spacing:-.04em}.chat-toolbar{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap}.chat-toolbar .llm-field{flex:1;margin:0;min-width:180px}.chat-transcript{min-height:200px;max-height:60vh;overflow-y:auto;padding:16px 0;margin:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.chat-empty{color:var(--muted);font-family:Georgia,serif;font-size:21px;text-align:center;padding:36px 12px}.chat-message{padding:16px;border-radius:12px;margin:0 0 12px;border:1px solid var(--line);background:var(--paper)}.chat-message[data-role="user"]{background:#edf1e9;margin-left:24px}.chat-message[data-role="assistant"]{margin-right:24px}.chat-message p{white-space:pre-wrap;overflow-wrap:anywhere;font:16px/1.65 system-ui,sans-serif;margin:7px 0 0}.chat-composer textarea{resize:vertical;min-height:104px}.chat-composer .llm-field{margin:0 0 8px}.chat-composer .llm-actions{justify-content:space-between}.chat-count{font-size:12px;color:var(--muted)}.llm-link{color:var(--accent);font-size:14px}.llm-loading{color:var(--muted);font-size:14px}@media(max-width:600px){.llm-grid{grid-template-columns:1fr}.llm-panel{padding:18px}.chat-message[data-role="user"]{margin-left:10px}.chat-message[data-role="assistant"]{margin-right:10px}.chat-toolbar{align-items:stretch}.chat-toolbar .llm-secondary{align-self:flex-end}.chat-transcript{max-height:55vh}}
 </style>`;
 
-const providerOptions = `<option value="auto">Auto — prefer hosted</option><option value="hosted_openai">OpenAI · Hosted</option><option value="hosted_anthropic">Anthropic · Hosted</option><option value="byok_openai">OpenAI · My API key</option><option value="byok_anthropic">Anthropic · My API key</option>`;
+export const providerOptions = `<option value="auto">Auto — prefer hosted</option><option value="hosted_openai">OpenAI · Hosted</option><option value="hosted_anthropic">Anthropic · Hosted</option><option value="byok_openai">OpenAI · My API key</option><option value="byok_anthropic">Anthropic · My API key</option>`;
 
-const clientHelpers = String.raw`
+export const clientHelpers = String.raw`
   const labels = {auto: 'Auto — prefer hosted', hosted_openai: 'OpenAI · Hosted', hosted_anthropic: 'Anthropic · Hosted', byok_openai: 'OpenAI · My API key', byok_anthropic: 'Anthropic · My API key'};
   const notice = (element, message, isError = false) => { element.textContent = message; element.dataset.error = String(isError); };
   const available = (settings, provider) => {
@@ -95,78 +95,6 @@ export function settingsPanel(): string {
   })();</script>`;
 }
 
-export function chatPage(authenticated: boolean): string {
-  const intro = `${llmStyles}<section class="chat-hero"><div class="kicker">A place to think</div><h1>Start a conversation.</h1><p class="lede">Explore an idea with OpenAI or Anthropic.</p></section>`;
-  if (!authenticated) return `${intro}<section class="panel llm-panel"><h2>Your conversation starts here.</h2><p>Sign in to use a hosted model or connect your own API key.</p><a class="btn" style="display:inline-block;text-decoration:none" href="/login">Create account / Sign in</a></section>`;
-  return `${intro}<section class="panel llm-panel" aria-label="Chat"><div class="chat-toolbar"><label class="llm-field" for="chat-provider">Provider<select id="chat-provider" disabled>${providerOptions}</select></label><button class="llm-secondary" type="button" id="chat-clear" disabled>Clear conversation</button></div><p class="llm-help">Messages are sent to the selected provider. This conversation stays in this tab and is cleared when you leave or reload. <a href="/me#llm-settings">Manage AI settings</a></p><p id="chat-provider-status" class="llm-status">Loading provider availability…</p>
-  <div class="chat-transcript" id="chat-transcript" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions text"><p id="chat-empty" class="chat-empty">What are you curious about?</p></div>
-  <form id="chat-form" class="chat-composer"><label class="llm-field" for="chat-input">Your message<textarea id="chat-input" rows="3" maxlength="4000" placeholder="Ask a question, test an idea, follow a thought…" disabled required></textarea></label><div class="llm-actions"><span id="chat-count" class="chat-count">0 / 4,000 characters · 0 / 20 exchanges</span><button class="btn" id="chat-send" type="submit" disabled>Send message</button></div></form><p id="chat-notice" class="llm-notice" role="status" aria-live="polite">Loading AI settings…</p>
-  </section><script>(() => {
-  ${clientHelpers}
-  const select = document.getElementById('chat-provider');
-  const input = document.getElementById('chat-input');
-  const status = document.getElementById('chat-notice');
-  const transcript = document.getElementById('chat-transcript');
-  const messages = [];
-  let settings;
-  let pending = false;
-  const historySize = () => messages.reduce((sum, message) => sum + message.content.length, 0);
-  const historyFull = () => messages.length >= 40 || historySize() >= 64000 || messages.some(message => message.content.length > 16000);
-  const controls = () => {
-    const ready = settings && available(settings, select.value);
-    select.disabled = pending || !settings;
-    input.disabled = pending || !ready || historyFull();
-    document.getElementById('chat-send').disabled = pending || !ready || historyFull() || !input.value.trim();
-    document.getElementById('chat-send').textContent = pending ? 'Thinking…' : 'Send message';
-    document.getElementById('chat-clear').disabled = pending || messages.length === 0;
-    document.getElementById('chat-count').textContent = input.value.length.toLocaleString() + ' / 4,000 characters · ' + Math.ceil(messages.length / 2) + ' / 20 exchanges';
-    document.getElementById('chat-form').setAttribute('aria-busy', String(pending));
-  };
-  const addMessage = (role, content) => {
-    const empty = document.getElementById('chat-empty');
-    if (empty) empty.remove();
-    const article = document.createElement('article');
-    article.className = 'chat-message'; article.dataset.role = role;
-    const label = document.createElement('div'); label.className = 'role'; label.textContent = role === 'user' ? 'You' : 'Assistant';
-    const text = document.createElement('p'); text.textContent = content;
-    article.append(label, text); transcript.append(article); transcript.scrollTop = transcript.scrollHeight;
-    return article;
-  };
-  const providerStatus = () => {
-    if (!settings) return;
-    const ready = available(settings, select.value);
-    document.getElementById('chat-provider-status').textContent = ready ? (select.value === 'auto' ? 'Auto prefers configured hosted providers, then your saved keys.' : labels[select.value] + ' is ready.') : 'No key is configured for this selection. Open AI settings to add one.';
-    controls();
-  };
-  select.addEventListener('change', providerStatus);
-  input.addEventListener('input', controls);
-  document.getElementById('chat-clear').addEventListener('click', () => {
-    if (pending) return;
-    messages.length = 0; transcript.replaceChildren();
-    const empty = document.createElement('p'); empty.id = 'chat-empty'; empty.className = 'chat-empty'; empty.textContent = 'What are you curious about?'; transcript.append(empty);
-    notice(status, 'Conversation cleared.'); controls(); input.focus();
-  });
-  document.getElementById('chat-form').addEventListener('submit', async event => {
-    event.preventDefault();
-    const content = input.value.trim();
-    if (pending || !settings || !available(settings, select.value) || !content || content.length > 4000 || historyFull()) return;
-    if (historySize() + content.length > 64000) { notice(status, 'This conversation is too long to send. Shorten your message or clear the conversation to start again.', true); return; }
-    const requestProvider = select.value;
-    pending = true; input.value = ''; controls(); notice(status, 'Waiting for a reply…');
-    const userMessage = {role: 'user', content};
-    const userElement = addMessage('user', content);
-    try {
-      const result = await api('/api/chat', 'POST', {provider: requestProvider, messages: [...messages, userMessage]});
-      if (!result.message || typeof result.message.content !== 'string') throw new Error('The provider returned an unexpected response. Please try again.');
-      const reply = result.message.content;
-      messages.push(userMessage, {role: 'assistant', content: reply});
-      addMessage('assistant', reply);
-      notice(status, (labels[result.provider] || 'Assistant') + (result.model ? ' · ' + result.model : '') + (historyFull() ? ' · Conversation limit reached. Clear the conversation to start again.' : ''));
-    } catch (error) {
-      userElement.remove(); input.value = content;
-      notice(status, error.message, true);
-    } finally { pending = false; controls(); if (!input.disabled) input.focus(); }
-  });
-  api('/api/llm/settings').then(result => { settings = result; fillProviders(select, settings); select.value = labels[settings.provider] ? settings.provider : 'auto'; providerStatus(); notice(status, ''); }).catch(error => notice(status, error.message, true));
-  })();</script>`;
+export function chatSignInPage(): string {
+  return `${llmStyles}<section class="chat-hero"><div class="kicker">A place to think</div><h1>Follow your question.</h1><p class="lede">Search related explorations, think with AI, and keep a map of your questions.</p></section><section class="panel llm-panel"><h2>Your conversation starts here.</h2><p>Sign in to save your conversations and use a hosted model or your own API key.</p><a class="btn" style="display:inline-block;text-decoration:none" href="/login">Create account / Sign in</a></section>`;
 }

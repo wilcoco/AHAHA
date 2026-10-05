@@ -5,6 +5,7 @@ import { once } from "node:events";
 import http from "node:http";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
+import { createWorkspace, initWorkspaceDb } from "../src/workspace.js";
 import { createChatApi, initChatDb } from "../src/chat.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -42,11 +43,16 @@ async function listen(server: http.Server) {
 
 async function harness(t: TestContext) {
   const { pool } = await isolatedDatabase(t);
-  await pool.query("CREATE TABLE users(id uuid PRIMARY KEY)");
+  await pool.query("CREATE TABLE users(id uuid PRIMARY KEY, username text DEFAULT 'tester',display_name text DEFAULT 'Tester')");
   const users = { alice: randomUUID(), bob: randomUUID() };
   await pool.query("INSERT INTO users(id) VALUES($1),($2)", [users.alice, users.bob]);
   const q = (sql: string, params: any[] = []) => pool.query(sql, params);
   await initChatDb(q);
+  await initWorkspaceDb(q);
+  await q(`CREATE TABLE explorations(id uuid PRIMARY KEY,user_id uuid REFERENCES users(id),slug text,title text,opening_question text DEFAULT '',
+    starting_view text DEFAULT '',key_turns jsonb DEFAULT '[]',turning_points jsonb DEFAULT '[]',current_view text DEFAULT '',
+    source_platform text,source_model text,status text DEFAULT 'draft',created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),published_at timestamptz);
+    CREATE TABLE source_messages(id uuid PRIMARY KEY,exploration_id uuid REFERENCES explorations(id),position integer,role text,content text);`);
   await initChatDb(q); // Startup migrations must remain safe across deployments.
   const env: NodeJS.ProcessEnv = {
     HOSTED_OPENAI_API_KEY: fakeKey(), HOSTED_OPENAI_MODEL: "gpt-4.1-mini",
@@ -60,6 +66,7 @@ async function harness(t: TestContext) {
   let databaseError = false;
   const api = createChatApi({
     env,
+    workspace: createWorkspace(q),
     q: (sql, params) => {
       if (databaseError) throw new Error("sensitive-database-detail " + env.HOSTED_OPENAI_API_KEY);
       return q(sql, params);
@@ -332,4 +339,74 @@ test("real server preserves sign-in, OAuth PKCE, and private Exploration MCP wor
   const fetched = await rpc("tools/call", { name: "get_exploration", arguments: { id_or_slug: exploration.id } });
   assert.equal(fetched.result.structuredContent.result.exploration.id, exploration.id);
   assert.equal((await fetch(origin + "/@" + username + "/" + exploration.slug)).status, 404);
+});
+
+
+test("saved conversations survive reload, isolate owners, reject stale edits, and deduplicate retries", options, async t => {
+  const h=await harness(t);
+  const created=await h.request('/api/conversations','POST',{});
+  assert.equal(created.status,201);
+  const c=created.data.conversation;
+  const payload={conversation_id:c.id,revision:0,request_id:randomUUID(),message:'What makes a useful exploration?',source_ids:[]};
+  assert.equal((await h.request('/api/conversations/'+c.id,'GET',undefined,'bob')).status,404);
+  assert.equal((await h.request('/api/chat','POST',payload,'bob')).status,404);
+  assert.equal((await h.request('/api/conversations','GET',undefined,null)).status,401);
+  assert.equal((await h.request('/api/conversations','POST',{},'alice',{origin:'https://attacker.invalid'})).status,403);
+  const sent=await h.request('/api/chat','POST',payload);
+  assert.equal(sent.status,200);
+  assert.equal(sent.data.conversation.messages.length,2);
+  assert.equal(sent.data.conversation.revision,1);
+  assert(!('pending_token' in sent.data.conversation));
+  const restored=await h.request('/api/conversations/'+c.id);
+  assert.deepEqual(restored.data.conversation.messages,sent.data.conversation.messages);
+  assert.equal((await h.request('/api/conversations')).data.conversations.length,1);
+  assert.equal((await h.request('/api/conversations','GET',undefined,'bob')).data.conversations.length,0);
+  assert.equal((await h.request('/api/chat','POST',payload)).status,200);
+  assert.equal(h.calls.length,1);
+  assert.equal((await h.request('/api/chat','POST',{...payload,request_id:randomUUID()})).status,409);
+  const updated=await h.request('/api/conversations/'+c.id,'PATCH',{revision:1,title:'My thinking',reflection:{starting_view:'Start',turning_points:'A new perspective',current_view:'My own conclusion'}});
+  assert.equal(updated.status,200);
+  assert.equal(updated.data.conversation.revision,2);
+  assert.equal((await h.request('/api/conversations/'+c.id,'PATCH',{revision:1,title:'Stale',reflection:{}})).status,409);
+  h.setUpstream(async()=>new Response('private error',{status:503}));
+  assert.equal((await h.request('/api/chat','POST',{...payload,revision:2,request_id:randomUUID(),message:'Continue'})).status,502);
+  const failed=await h.request('/api/conversations/'+c.id);
+  assert.equal(failed.data.conversation.messages.length,2);
+  assert.equal(failed.data.conversation.busy,false);
+});
+
+test("references respect visibility and draft publishing snapshots the reviewed conversation", options, async t=>{
+ const h=await harness(t),publicId=randomUUID(),privateId=randomUUID();
+ await h.pool.query("INSERT INTO explorations(id,user_id,slug,title,current_view,status) VALUES($1,$3,'public','Connected thinking','Reference insight','published'),($2,$3,'private','Secret draft','Private insight','draft')",[publicId,privateId,h.users.bob]);
+ const created=(await h.request('/api/conversations','POST',{})).data.conversation;
+ const p={conversation_id:created.id,revision:0,request_id:randomUUID(),message:'How does thinking connect?',source_ids:[privateId]};
+ assert.equal((await h.request('/api/explorations/'+privateId)).status,404);
+ assert.equal((await h.request('/api/chat','POST',p)).status,404);
+ assert.equal(h.calls.length,0);
+ const search=await h.request('/api/explorations/search?scope=public&q=thinking');
+ assert.equal(search.status,200);
+ assert.deepEqual(search.data.explorations.map((e:any)=>e.id),[publicId]);
+ assert.equal((await h.request('/api/explorations/search?scope=mine')).data.explorations.length,0);
+ const reply=await h.request('/api/chat','POST',{...p,source_ids:[publicId]});
+ assert.equal(reply.status,200);
+ assert.match(h.calls[0].body.input[0].content,/Reference insight/);
+ assert(!h.calls[0].body.input[0].content.includes('Private insight'));
+ assert.equal(reply.data.conversation.sources[0].id,publicId);
+ assert.equal((await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:1})).status,400);
+ const reflection={starting_view:'I was uncertain.',turning_points:'I considered the source.\nI tested an alternative.',current_view:'My own view.'};
+ const revised=(await h.request('/api/conversations/'+created.id,'PATCH',{revision:1,title:'A reviewed exploration',reflection})).data.conversation;
+ const draft=await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:revised.revision});
+ assert.equal(draft.status,201);
+ const id=draft.data.id;
+ assert.equal((await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:revised.revision})).data.id,id);
+ const detail=await h.request('/api/explorations/'+id);
+ assert.equal(detail.data.exploration.status,'draft');
+ assert.equal(detail.data.exploration.current_view,'My own view.');
+ assert.equal(detail.data.messages.length,2);
+ assert.equal(detail.data.can_publish,true);
+ assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,'bob')).status,404);
+ assert.equal((await h.request('/api/explorations/'+publicId+'/publish','POST',{})).status,404);
+ assert.equal((await h.request('/api/explorations/'+id+'/publish','POST',{})).status,200);
+ assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,'bob')).data.exploration.status,'published');
+ assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,'bob')).data.can_publish,false);
 });
