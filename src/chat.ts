@@ -111,11 +111,12 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
   }
 
   return async function handleChatApi(req: IncomingMessage, res: ServerResponse, pathname: string, origin: string) {
-    const isWorkspace = pathname.startsWith("/api/conversations") || pathname.startsWith("/api/explorations/");
+    const isWorkspace = pathname.startsWith("/api/conversations") || pathname.startsWith("/api/explorations/") || pathname.startsWith("/api/support/");
     if (pathname !== "/api/chat" && !pathname.startsWith("/api/llm/") && !isWorkspace) return false;
     try {
       // Web sessions only: MCP/OAuth credentials never authorize spending or managing LLM keys.
       const user = await authenticate(req);
+      if(!user&&isWorkspace&&req.method==='GET'&&pathname.startsWith('/api/explorations/')&&workspace){await workspace.api(req,res,new URL(req.url!,origin),null,origin);return true;}
       if (!user) throw new AppError(401, "sign_in_required", "Sign in to Exploration to continue.");
       if (req.method !== "GET") requireSameOrigin(req, origin);
 

@@ -5,7 +5,8 @@ import { once } from "node:events";
 import http from "node:http";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
-import { createWorkspace, initWorkspaceDb } from "../src/workspace.js";
+import { createWorkspace, initWorkspaceDb, initPublicationDb } from "../src/workspace.js";
+import { createSupport, initSupportDb } from "../src/support.js";
 import { createChatApi, initChatDb } from "../src/chat.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -45,7 +46,7 @@ async function harness(t: TestContext) {
   const { pool } = await isolatedDatabase(t);
   await pool.query("CREATE TABLE users(id uuid PRIMARY KEY, username text DEFAULT 'tester',display_name text DEFAULT 'Tester')");
   const users = { alice: randomUUID(), bob: randomUUID() };
-  await pool.query("INSERT INTO users(id) VALUES($1),($2)", [users.alice, users.bob]);
+  await pool.query("INSERT INTO users(id,username) VALUES($1,'alice'),($2,'bob')", [users.alice, users.bob]);
   const q = (sql: string, params: any[] = []) => pool.query(sql, params);
   await initChatDb(q);
   await initWorkspaceDb(q);
@@ -53,6 +54,10 @@ async function harness(t: TestContext) {
     starting_view text DEFAULT '',key_turns jsonb DEFAULT '[]',turning_points jsonb DEFAULT '[]',current_view text DEFAULT '',
     source_platform text,source_model text,status text DEFAULT 'draft',created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),published_at timestamptz);
     CREATE TABLE source_messages(id uuid PRIMARY KEY,exploration_id uuid REFERENCES explorations(id),position integer,role text,content text);`);
+  await initPublicationDb(q);
+  await initSupportDb(q);
+  await initPublicationDb(q);
+  await initSupportDb(q);
   await initChatDb(q); // Startup migrations must remain safe across deployments.
   const env: NodeJS.ProcessEnv = {
     HOSTED_OPENAI_API_KEY: fakeKey(), HOSTED_OPENAI_MODEL: "gpt-4.1-mini",
@@ -66,7 +71,7 @@ async function harness(t: TestContext) {
   let databaseError = false;
   const api = createChatApi({
     env,
-    workspace: createWorkspace(q),
+    workspace: createWorkspace(q,createSupport(pool)),
     q: (sql, params) => {
       if (databaseError) throw new Error("sensitive-database-detail " + env.HOSTED_OPENAI_API_KEY);
       return q(sql, params);
@@ -389,8 +394,8 @@ test("references respect visibility and draft publishing snapshots the reviewed 
  assert.equal((await h.request('/api/explorations/search?scope=mine')).data.explorations.length,0);
  const reply=await h.request('/api/chat','POST',{...p,source_ids:[publicId]});
  assert.equal(reply.status,200);
- assert.match(h.calls[0].body.input[0].content,/Reference insight/);
- assert(!h.calls[0].body.input[0].content.includes('Private insight'));
+ assert.match(JSON.stringify(h.calls[0].body.input),/Reference insight/);
+ assert(!JSON.stringify(h.calls[0].body.input).includes('Private insight'));
  assert.equal(reply.data.conversation.sources[0].id,publicId);
  assert.equal((await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:1})).status,400);
  const reflection={starting_view:'I was uncertain.',turning_points:'I considered the source.\nI tested an alternative.',current_view:'My own view.'};
@@ -409,4 +414,82 @@ test("references respect visibility and draft publishing snapshots the reviewed 
  assert.equal((await h.request('/api/explorations/'+id+'/publish','POST',{})).status,200);
  assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,'bob')).data.exploration.status,'published');
  assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,'bob')).data.can_publish,false);
+});
+
+test('AI documents, manual edits, immutable versions and inherited conversations remain paired',options,async t=>{
+ const h=await harness(t);
+ let c=(await h.request('/api/conversations','POST',{topic:'과학'})).data.conversation;
+ const chat=(action:string,extra={})=>h.request('/api/chat','POST',{action,conversation_id:c.id,revision:c.revision,request_id:randomUUID(),...extra});
+ c=(await chat('chat',{message:'도시의 나무에 관한 글을 함께 쓰자.'})).data.conversation;
+ const transcript=c.messages;
+ h.setUpstream(async()=>Response.json({output:[{type:'message',content:[{type:'output_text',text:'# 도시의 나무\n\n## 관점\n대화에서 출발한 문서.'}]}]}));
+ const generated=await chat('document');assert.equal(generated.status,200);c=generated.data.conversation;
+ assert.equal(c.title,'도시의 나무');assert.equal(c.document_message_count,2);assert.deepEqual(c.messages,transcript);
+ assert.match(JSON.stringify(h.calls.at(-1)?.body),/existing_draft/);
+ const doc='# 도시의 나무\n\n'+('내가 직접 고친 내용. '.repeat(1000));
+ const edited=await h.request('/api/conversations/'+c.id,'PATCH',{revision:c.revision,document_body:doc});assert.equal(edited.status,200);c=edited.data.conversation;
+ h.setUpstream(async()=>new Response('error',{status:503}));
+ assert.equal((await chat('document')).status,502);
+ c=(await h.request('/api/conversations/'+c.id)).data.conversation;
+ assert.equal(c.document_body,doc.trim());assert.equal(c.busy,false);
+ const id=(await h.request('/api/conversations/'+c.id+'/draft','POST',{revision:c.revision})).data.id;
+ assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,null)).status,404);
+ assert.equal((await h.request('/api/explorations/'+id+'/branch','POST',{kind:'fork'},'bob')).status,404);
+ assert.equal((await h.request('/api/explorations/'+id+'/publish','POST',{})).status,200);
+ const article=(await h.request('/api/explorations/'+id,'GET',undefined,null)).data;
+ assert.equal(article.exploration.document_body,doc.trim());assert.deepEqual(article.messages,transcript);
+ assert.equal((await h.request('/api/explorations/'+id+'/branch','POST',{kind:'revision'},'bob')).status,403);
+ const fork=(await h.request('/api/explorations/'+id+'/branch','POST',{kind:'rebuttal'},'bob')).data.conversation;
+ assert.equal(fork.parent_exploration_id,id);assert.deepEqual(fork.base_messages,transcript);assert.equal(fork.messages.length,0);
+ const revised=(await h.request('/api/conversations/'+fork.id,'PATCH',{revision:0,title:'다른 관점',document_body:'# 다른 관점\n\n원문에 반박한다.'},'bob')).data.conversation;
+ const child=(await h.request('/api/conversations/'+fork.id+'/draft','POST',{revision:revised.revision},'bob')).data.id;
+ assert(!(await h.request('/api/explorations/search?q=나무')).data.explorations.some((e:any)=>e.id===child));
+ assert(!(await h.request('/api/explorations/'+id)).data.lineage.some((e:any)=>e.id===child));
+ await h.request('/api/explorations/'+child+'/publish','POST',{},'bob');
+ const tree=(await h.request('/api/explorations/search?q=나무','GET',undefined,null)).data.explorations;
+ assert.equal(tree.find((e:any)=>e.id===child).parent_id,id);
+ const inherited=(await h.request('/api/explorations/'+child,'GET',undefined,null)).data;
+ assert.equal(inherited.exploration.relation_kind,'rebuttal');assert.equal(inherited.exploration.root_id,id);assert.deepEqual(inherited.messages,transcript);
+ assert.equal((await h.request('/api/explorations/'+id)).data.exploration.document_body,doc.trim());
+ const newEdit=(await h.request('/api/conversations/'+c.id,'PATCH',{revision:c.revision,document_body:'# 다음 버전\n수정'})).data.conversation;
+ const revision=(await h.request('/api/conversations/'+c.id+'/draft','POST',{revision:newEdit.revision})).data.id;
+ const version=(await h.request('/api/explorations/'+revision)).data.exploration;
+ assert.equal(version.parent_id,id);assert.equal(version.relation_kind,'revision');assert.equal(version.version_number,2);
+});
+
+test('free point support conserves balances, rewards earlier supporters and rejects stale or duplicate spending',options,async t=>{
+ const h=await harness(t),author=randomUUID(),charlie=randomUUID(),id=randomUUID(),other=randomUUID();
+ await h.pool.query("INSERT INTO users(id,username) VALUES($1,'writer'),($2,'charlie')",[author,charlie]);
+ await h.pool.query("INSERT INTO explorations(id,user_id,title,status) VALUES($1,$3,'Knowledge','published'),($2,$3,'Private','draft')",[id,other,author]);
+ const svc=createSupport(h.pool);
+ const path='/api/explorations/'+id+'/support';
+ const amount=(percentage:number,balance:number)=>({request_id:randomUUID(),percentage,expected_balance:balance});
+ assert.equal((await h.request('/api/support/wallet')).data.balance,1000);
+ const p=amount(10,1000),first=await h.request(path,'POST',p);
+ assert.equal(first.status,200);assert.equal(first.data.amount,100);assert.equal(first.data.author_received,100);assert.equal(first.data.prior_supporters_received,0);
+ assert.deepEqual((await h.request(path,'POST',p)).data,first.data);
+ assert.equal((await h.request('/api/support/wallet')).data.balance,900);
+ assert.equal((await h.request(path,'POST',amount(10,1000))).status,409);
+ const second=await h.request(path,'POST',amount(20,1000),'bob');
+ assert.equal(second.data.amount,200);assert.equal(second.data.author_received,140);assert.equal(second.data.prior_supporters_received,60);
+ assert.equal((await svc.wallet(author)).balance,1240);assert.equal((await svc.wallet(h.users.alice)).balance,960);
+ const third=await svc.invest(charlie,id,amount(10,1000));
+ assert.equal(third.author_received,70);assert.equal(third.prior_supporters_received,30);
+ assert.equal((await svc.wallet(h.users.alice)).balance,970);assert.equal((await svc.wallet(h.users.bob)).balance,820);
+ const repeat=await h.request(path,'POST',amount(10,970));
+ assert.equal(repeat.data.amount,97);assert.equal(repeat.data.author_received,69);assert.equal(repeat.data.prior_supporters_received,28);
+ assert.equal((await svc.wallet(h.users.alice)).balance,873); // no self-rebate
+ await assert.rejects(svc.invest(author,id,amount(10,1000)),(e:any)=>e.code==='self_support');
+ assert.equal((await h.request('/api/explorations/'+other+'/support','POST',amount(10,873))).status,404);
+ assert.equal((await h.request(path,'POST',amount(10,873),null)).status,401);
+ assert.equal((await h.request(path,'POST',amount(10,873),'alice',{origin:'https://attacker.invalid'})).status,403);
+ assert.equal((await h.request(path,'POST',amount(101,873))).status,400);
+ assert.equal((await h.request(path,'POST',{...amount(10,873),request_id:'-'.repeat(36)})).status,400);
+ const race=await Promise.all([h.request(path,'POST',amount(10,873)),h.request(path,'POST',amount(10,873))]);
+ assert.deepEqual(race.map(r=>r.status).sort(),[200,409]);
+ const eventSums=(await h.pool.query('SELECT event_id,SUM(amount) AS n FROM point_ledger WHERE event_id IS NOT NULL GROUP BY event_id')).rows;
+ assert(eventSums.every(r=>Number(r.n)===0));
+ const balances=(await h.pool.query('SELECT w.balance,SUM(l.amount) AS ledger FROM point_wallets w JOIN point_ledger l USING(user_id) GROUP BY w.user_id,w.balance')).rows;
+ assert(balances.every(r=>r.balance===r.ledger));assert.equal(balances.reduce((n,r)=>n+Number(r.balance),0),4000);
+ assert.equal((await h.request(path,'GET',undefined,null)).data.total,584);
 });
