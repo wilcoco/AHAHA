@@ -422,8 +422,10 @@ test('AI documents, manual edits, immutable versions and inherited conversations
  const chat=(action:string,extra={})=>h.request('/api/chat','POST',{action,conversation_id:c.id,revision:c.revision,request_id:randomUUID(),...extra});
  c=(await chat('chat',{message:'도시의 나무에 관한 글을 함께 쓰자.'})).data.conversation;
  const transcript=c.messages;
- h.setUpstream(async()=>Response.json({output:[{type:'message',content:[{type:'output_text',text:'# 도시의 나무\n\n## 관점\n대화에서 출발한 문서.'}]}]}));
+ h.setUpstream(async()=>Response.json({output:[{type:'message',content:[{type:'output_text',text:'# 도시의 나무\n\n## 관점\n대화에서 출발한 문서. [출처](https://invented.example/not-provided)'}]}]}));
  const generated=await chat('document');assert.equal(generated.status,200);c=generated.data.conversation;
+ assert(!c.document_body.includes('invented.example'));assert.match(c.document_body,/출처 링크 확인 필요/);
+ assert(!(await h.pool.query('SELECT document_body FROM chat_document_revisions WHERE conversation_id=$1',[c.id])).rows.some(r=>r.document_body.includes('invented.example')));
  assert.equal(c.title,'도시의 나무');assert.equal(c.document_message_count,2);assert.deepEqual(c.messages,transcript);
  assert.match(JSON.stringify(h.calls.at(-1)?.body),/existing_draft/);
  const doc='# 도시의 나무\n\n'+('내가 직접 고친 내용. '.repeat(1000));
@@ -545,6 +547,7 @@ test('a saved knowledge document reaches the next model request and its source i
  const data={conversation_id:c.id,revision:c.revision,request_id:randomUUID(),message:'Use the reference document.'};
  const reply=await h.request('/api/chat','POST',data);assert.equal(reply.status,200);c=reply.data.conversation;
  assert(JSON.stringify(h.calls.at(-1)?.body).includes('KNOWLEDGE_WHEEL_TOKEN_719'));
+ assert(JSON.stringify(h.calls.at(-1)?.body).includes('/chat?exploration='+docId));
  assert.deepEqual(reply.data.injected_ids,[docId]);assert.equal(c.messages[1].references[0].id,docId);
  const retry=await h.request('/api/chat','POST',data);assert.deepEqual(retry.data.injected_ids,[docId]);assert.equal(h.calls.length,1);
  const cleared=await h.request('/api/conversations/'+c.id,'PATCH',{revision:c.revision,source_ids:[]});c=cleared.data.conversation;

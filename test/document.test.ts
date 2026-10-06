@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderDocument, documentRendererScript } from '../src/document.js';
+import { renderDocument, documentRendererScript, groundDocumentLinks } from '../src/document.js';
 import { workspacePage } from '../src/workspace-ui.js';
 import { publishedArticle, blogHome } from '../src/blog-ui.js';
 
@@ -20,4 +20,15 @@ test('workspace script embeds the shared renderer as self-contained valid JavaSc
   const scripts=[...workspacePage(signedIn).matchAll(/<script>([\s\S]*?)<\/script>/g)];
   assert.equal(scripts.length,1);new Function(scripts[0][1]);
  }
+});
+
+
+test('generated citation destinations must be present in the supplied material',()=>{
+ const path='/chat?exploration=12345678-1234-1234-1234-123456789abc';
+ const input=JSON.stringify({references:[{url:path,body:'https://example.com/evidence?x=1&y=2'}]});
+ const result=groundDocumentLinks('[Blog]('+path+') and [wrong](https://obsidian.md) and https://example.com/evidence?x=1&y=2. New https://invented.example/story.',input);
+ assert(result.includes(path));assert(result.includes('https://example.com/evidence?x=1&y=2.'));
+ assert(!result.includes('obsidian.md'));assert(!result.includes('invented.example'));assert.match(result,/wrong \[출처 링크 확인 필요\]/);
+ assert.equal(groundDocumentLinks('No links; keep the author’s wording.',''),'No links; keep the author’s wording.');
+ assert(!groundDocumentLinks('https://example.com/evidence/forged','https://example.com/evidence').includes('https://'));
 });

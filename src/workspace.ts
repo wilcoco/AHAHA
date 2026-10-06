@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { AppError, type ChatMessage } from './llm.js';
 import type { createSupport } from './support.js';
 import { branchPoint, documentDiff, transcriptDiff } from './versioning.js';
-import { legacyDocument, documentPrompt } from './document.js';
+import { legacyDocument, documentPrompt, groundDocumentLinks } from './document.js';
 import { json, readJson, requireSameOrigin } from './chat.js';
 
 type Query = (sql: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number | null }>;
@@ -79,7 +79,7 @@ export function createWorkspace(q: Query, support?: ReturnType<typeof createSupp
   }
   async function references(userId:string,ids:unknown){
     if(!Array.isArray(ids)||ids.length>3||ids.some(id=>!uuid(id))||new Set(ids).size!==ids.length)throw new AppError(400,'invalid_sources','참고할 글은 최대 3개까지 선택하세요.');
-    const refs=[];for(const id of ids){const e=await source(userId,id);refs.push({id:e.id,title:e.title,username:e.username,slug:e.slug,status:e.status,opening_question:e.opening_question.slice(0,800),current_view:e.current_view.slice(0,2000),document_excerpt:legacyDocument(e).slice(0,3000)});}return refs;
+    const refs=[];for(const id of ids){const e=await source(userId,id);refs.push({id:e.id,title:e.title,username:e.username,url:'/chat?exploration='+e.id,slug:e.slug,status:e.status,opening_question:e.opening_question.slice(0,800),current_view:e.current_view.slice(0,2000),document_excerpt:legacyDocument(e).slice(0,3000)});}return refs;
   }
   async function versions(userId:string|null,e:any){
     return (await q(`SELECT e.id,e.parent_id,e.title,e.relation_kind,e.version_number,e.status,e.branch_anchor,u.username FROM explorations e JOIN users u ON u.id=e.user_id
@@ -173,7 +173,7 @@ export function createWorkspace(q: Query, support?: ReturnType<typeof createSupp
   }
   async function finish(userId: string, p: any, result: any) {
     if (p.action === 'document') {
-      const body=result.content.trim();
+      const body=groundDocumentLinks(result.content.trim(),p.messages.map((m:ChatMessage)=>m.content).join('\n'));
       if(body.length>30000)throw new AppError(502,'document_too_large','생성된 문서가 너무 깁니다. 더 짧게 정리해 주세요.');
       const heading=body.match(/^#\s+(.+)/)?.[1]?.slice(0,150);
       const title=heading && (!p.row.document_body && (p.row.title==='New exploration'||p.row.title===p.row.messages[0]?.content.slice(0,100))) ? heading : p.row.title;
