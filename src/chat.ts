@@ -153,7 +153,7 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
         const data = await readJson(req, 300000);
         const prepared = data.conversation_id !== undefined && workspace ? await workspace.prepare(user.id,data) : null;
         if (prepared?.cached) {
-          json(res,200,{conversation:workspace!.publicConversation(prepared.row),provider:prepared.row.provider,model:prepared.row.model,message:prepared.row.messages.at(-1)});
+          json(res,200,{conversation:workspace!.publicConversation(prepared.row),provider:prepared.row.provider,model:prepared.row.model,message:prepared.row.messages.at(-1),injected_ids:prepared.row.messages.at(-1)?.references?.map((r:any)=>r.id)||[]});
           return true;
         }
         const messages = validateMessages(prepared ? prepared.messages : data.messages);
@@ -188,7 +188,7 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
           const result = await callProvider(provider, messages, apiKey, env, fetchImpl);
           const conversation = prepared ? await workspace!.finish(user.id,prepared,result) : undefined;
           locked = false;
-          json(res, 200, { provider: result.provider, model: result.model, message: { role: "assistant", content: result.content }, ...(conversation ? {conversation} : {}) });
+          json(res, 200, { provider: result.provider, model: result.model, message: { role: "assistant", content: result.content }, ...(conversation ? {conversation,injected_ids:prepared?.injected?.map((r:any)=>r.id)||[]} : {}) });
         } finally {
           active.delete(user.id);
           if (locked && prepared) await workspace!.release(user.id,prepared);

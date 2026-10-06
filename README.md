@@ -22,7 +22,7 @@ Conversations and working documents are private. Saving a version creates a snap
 - `/blog` signed-in personal blog: published/private versions, working conversations, and points
 - `/@username/:slug` published exploration
 - `/me` creator account / private list / Hosted provider status / BYOK settings
-- `/chat` three-panel workspace: topic/version search, paired conversation, editable result document (public reading works without sign-in)
+- `/chat` three-panel workspace: topic-grouped document library, paired conversation, editable result document (public reading works without sign-in)
 - `POST /api/chat` send conversation messages to the selected provider
 - `GET /api/llm/settings` read provider preference and safe configuration status
 - `PUT /api/llm/settings` save provider preference
@@ -83,7 +83,7 @@ Available provider values:
 
 Open `/chat`, choose a provider, and send a message. The workspace sends a conversation ID, revision, request ID, new message, and selected reference IDs to `POST /api/chat`. The server loads the account-owned history and calls [OpenAI's Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create) or [Anthropic's Messages API](https://platform.claude.com/docs/en/api/messages/create) and returns the assistant response. API keys remain on the server after saving.
 
-Conversations are stored privately in PostgreSQL after each successful reply. The left panel searches published knowledge or your own articles and shows visible revisions, forks, and rebuttals as child nodes. Clicking a result opens the original conversation in the center and its document on the right. Search is keyword search of stored articles, not live web search. Private branches are visible only to their owner.
+Conversations are stored privately in PostgreSQL after each successful reply. The left panel is a topic-grouped document library, initially showing your own blog when signed in. It works without a search term; switch to the public blog to discover other authors. It shows visible revisions, forks, and rebuttals as child nodes. Clicking a result opens the original conversation in the center and its document on the right. Search is keyword search of stored articles, not live web search. Private branches are visible only to their owner.
 
 The center continues a private working conversation. Fork/rebuttal copies the source document and transcript into a new private conversation with attribution to its parent. Authors can also start a revision. The inherited transcript is collapsible; the original stays intact.
 
@@ -102,6 +102,25 @@ Workspace APIs (writes require a browser session and same origin; public explora
 - `GET /api/explorations/:id` — paired document, source dialogue, and visible lineage.
 - `POST /api/explorations/:id/branch` with `kind: "revision"|"fork"|"rebuttal"` — new private working branch; revision requires ownership.
 - `POST /api/explorations/:id/publish` — explicit owner-only publishing.
+
+## Branching, comparison, and document reuse
+
+Every question has “이 질문 바꿔 분기”; every answer has “이 답변에서 분기”. The first copies only the conversation before the selected question and places that question in the input for editing. The second copies the conversation through the selected answer. Both start a private fork or rebuttal, keep the original intact, and require another send action before calling an AI. Branching from a working conversation first preserves its current state as a private immutable snapshot.
+
+The branch records its message index, mode and excerpt. For an earlier point in a working conversation, it uses the latest saved document checkpoint at or before that point. Later answers and later document content are excluded. Older published snapshots have no earlier document checkpoints: a partial branch starts with an empty document for regeneration rather than importing the final document. A full branch retains the complete paired document and conversation.
+
+“버전 차이” compares the current document against an accessible version in the same family. It shows exact added/deleted Markdown lines, title/topic changes, the common conversation prefix and each version's remaining messages. This does not call an LLM or claim to be a semantic summary. Large documents use a bounded common-prefix/suffix diff instead of the more detailed line alignment. Private versions remain visible only to their owner, including comparison endpoints.
+
+Use “＋ 참고” in the library or “이 글 참고해서 새 글 쓰기” on an opened article to select up to three documents for the next conversation. The server checks source visibility again on every AI request and passes the first 3,000 characters of each selected document, plus bounded question/current-view metadata. An answer's “이 답변에 전달한 자료” banner records the IDs actually supplied (`injected_ids` in the response). A branch separately labels its inherited conversation/document context. The banner reports supplied context, not proof that the AI used every source or verified its claims. Removing a reference affects subsequent requests; existing answers and their provenance remain in the history.
+
+Additional API fields and routes:
+- `POST /api/conversations` accepts optional `source_ids`; `PATCH /api/conversations/:id` updates them with revision checking.
+- `POST /api/conversations/:id/branch` takes `revision`, `message_index`, `mode: "rewrite"|"continue"`, and `kind: "fork"|"rebuttal"`.
+- `POST /api/explorations/:id/branch` accepts the same optional point fields (without a working revision). Omitting them retains full-document branching.
+- `GET /api/explorations/:id` includes accessible family `versions`.
+- `GET /api/conversations/:id/compare?base=<exploration-id>` and `GET /api/explorations/:id/compare?base=<exploration-id>` return document/transcript differences. Without `base`, the working snapshot or parent is used.
+
+Design reference: [coral MVP screen plan](https://claude.ai/artifact/Qkb7h279DR6XrBGAj1W4nC) and [alter-ai's knowledge-loop test](https://github.com/wilcoco/alter-ai/blob/claude/mvp-build-deploy-zuf8tv/tests/test_one_wheel.py). This implementation adapts preserved originals and visible knowledge reuse for a personal AI co-created blog. It does not import that project's Python code, automatic canon promotion, or implicit sharing policy. Publication stays explicit; point support expresses support, not a truth verdict. The integration test checks that a saved document's excerpt actually reaches the next model request and its ID is returned and persisted with the answer.
 
 ## Free point support
 
@@ -219,7 +238,7 @@ npm test
 TEST_DATABASE_URL=postgres://localhost/exploration_test npm test
 ```
 
-Provider unit tests use mocked HTTP responses; they do not spend tokens or need real API keys. Integration tests use isolated database schemas and exercise encrypted storage, authorization, chat routing, saved conversation isolation, retry deduplication, reference visibility, document generation, immutable paired snapshots, branch visibility, point conservation/distribution, duplicate and concurrent spending protection, and the existing OAuth/MCP flow. Browser checks also cover the actual document renderer and mobile panel switching. A real provider inference smoke test is still needed after supplying real API keys.
+Provider unit tests use mocked HTTP responses; they do not spend tokens or need real API keys. Integration tests use isolated database schemas and exercise encrypted storage, authorization, chat routing, saved conversation isolation, retry deduplication, reference visibility, document generation, immutable paired snapshots, per-message branch checkpoints, exact version diffs, source-to-model reuse, branch visibility, point conservation/distribution, duplicate and concurrent spending protection, and the existing OAuth/MCP flow. Browser checks also cover the actual document renderer and mobile panel switching. A real provider inference smoke test is still needed after supplying real API keys.
 
 ## Stack
 

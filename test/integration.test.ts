@@ -493,3 +493,67 @@ test('free point support conserves balances, rewards earlier supporters and reje
  assert(balances.every(r=>r.balance===r.ledger));assert.equal(balances.reduce((n,r)=>n+Number(r.balance),0),4000);
  assert.equal((await h.request(path,'GET',undefined,null)).data.total,584);
 });
+
+test('branching at a Q&A keeps only the prefix and the document available at that point',options,async t=>{
+ const h=await harness(t);let c=(await h.request('/api/conversations','POST',{})).data.conversation;
+ const send=async(message:string)=>{const r=await h.request('/api/chat','POST',{conversation_id:c.id,revision:c.revision,request_id:randomUUID(),message});assert.equal(r.status,200);c=r.data.conversation;};
+ const edit=async(document_body:string)=>{c=(await h.request('/api/conversations/'+c.id,'PATCH',{revision:c.revision,document_body})).data.conversation;};
+ await send('FIRST_QUESTION');await edit('# Early document\nEARLY_ONLY');
+ await send('LATER_QUESTION');await edit('# Later document\nFUTURE_ONLY');
+ const originalId=c.id,originalRevision=c.revision;
+ const createBranch=(index:number,mode:string,revision=c.revision,user:'alice'|'bob'='alice')=>h.request('/api/conversations/'+originalId+'/branch','POST',{revision,message_index:index,mode,kind:'fork'},user);
+ assert.equal((await createBranch(1,'continue',c.revision,'bob')).status,404);
+ assert.equal((await createBranch(1,'continue',c.revision-1)).status,409);
+ assert.equal((await createBranch(0,'continue')).status,400);
+ assert.equal((await createBranch(1,'rewrite')).status,400);
+ assert.equal((await createBranch(12,'continue')).status,400);
+ const fromAnswer=await createBranch(1,'continue');assert.equal(fromAnswer.status,201);
+ const branch=fromAnswer.data.conversation;
+ assert.equal(branch.base_messages.length,2);assert.equal(branch.messages.length,0);assert.equal(branch.document_body,'# Early document\nEARLY_ONLY');
+ assert.equal(branch.branch_anchor.message_index,1);assert.equal(branch.input_draft,'');
+ const forkedReply=await h.request('/api/chat','POST',{conversation_id:branch.id,revision:0,request_id:randomUUID(),message:'FOLLOW_BRANCH'});
+ assert.equal(forkedReply.status,200);const input=JSON.stringify(h.calls.at(-1)?.body);
+ assert(input.includes('EARLY_ONLY'));assert(input.includes('FIRST_QUESTION'));assert(!input.includes('FUTURE_ONLY'));assert(!input.includes('LATER_QUESTION'));
+ assert.deepEqual(forkedReply.data.injected_ids,[branch.parent_exploration_id]);
+ const fromQuestion=(await createBranch(0,'rewrite')).data.conversation;
+ assert.deepEqual(fromQuestion.base_messages,[]);assert.equal(fromQuestion.document_body,'');assert.equal(fromQuestion.input_draft,'FIRST_QUESTION');
+ const changed=await h.request('/api/chat','POST',{conversation_id:fromQuestion.id,revision:0,request_id:randomUUID(),message:'REPLACEMENT_QUESTION'});
+ assert.equal(changed.status,200);assert.equal(changed.data.conversation.input_draft,'');
+ const replacedInput=JSON.stringify(h.calls.at(-1)?.body);assert(replacedInput.includes('REPLACEMENT_QUESTION'));assert(!replacedInput.includes('FIRST_QUESTION'));assert(!replacedInput.includes('FUTURE_ONLY'));
+ const restored=(await h.request('/api/conversations/'+originalId)).data.conversation;
+ assert.equal(restored.revision,originalRevision);assert.equal(restored.messages.length,4);assert.match(restored.document_body,/FUTURE_ONLY/);
+ const compare=await h.request('/api/conversations/'+branch.id+'/compare');assert.equal(compare.status,200);
+ assert.equal(compare.data.transcript.common,2);assert.equal(compare.data.transcript.removed.length,2);assert.equal(compare.data.transcript.added.length,2);
+ assert(compare.data.document.rows.some((r:any)=>r.kind==='add'&&r.text==='EARLY_ONLY'));
+ const version=(await h.request('/api/conversations/'+branch.id+'/draft','POST',{revision:forkedReply.data.conversation.revision})).data.id;
+ const frozen=(await h.request('/api/explorations/'+version)).data;
+ assert.equal(frozen.exploration.branch_anchor.message_index,1);assert.equal(frozen.messages[3].references[0].id,branch.parent_exploration_id);
+ assert.equal((await h.request('/api/explorations/'+version+'/compare','GET',undefined,'bob')).status,404);
+ await h.request('/api/explorations/'+version+'/publish','POST',{});
+ const publicVersion=(await h.request('/api/explorations/'+version,'GET',undefined,null)).data;
+ assert(!publicVersion.versions.some((e:any)=>e.id===branch.parent_exploration_id));
+ assert.equal((await h.request('/api/explorations/'+version+'/compare?base='+branch.parent_exploration_id,'GET',undefined,null)).status,404);
+ const publicFork=await h.request('/api/explorations/'+version+'/branch','POST',{message_index:1,mode:'continue',kind:'rebuttal'},'bob');
+ assert.equal(publicFork.status,201);assert.equal(publicFork.data.conversation.base_messages.length,2);assert.equal(publicFork.data.conversation.document_body,'');
+});
+
+test('a saved knowledge document reaches the next model request and its source is retained with the answer',options,async t=>{
+ const h=await harness(t),docId=randomUUID(),hidden=randomUUID();
+ await h.pool.query("INSERT INTO explorations(id,user_id,slug,title,document_body,status) VALUES($1,$3,'reference','A reusable document',$4,'published'),($2,$3,'hidden','Secret',$5,'draft')",[docId,hidden,h.users.bob,'# Reference\nKNOWLEDGE_WHEEL_TOKEN_719','UNAUTHORIZED_SECRET']);
+ const created=await h.request('/api/conversations','POST',{source_ids:[docId]});assert.equal(created.status,201);let c=created.data.conversation;
+ assert.equal((await h.request('/api/conversations','POST',{source_ids:[hidden]})).status,404);
+ const data={conversation_id:c.id,revision:c.revision,request_id:randomUUID(),message:'Use the reference document.'};
+ const reply=await h.request('/api/chat','POST',data);assert.equal(reply.status,200);c=reply.data.conversation;
+ assert(JSON.stringify(h.calls.at(-1)?.body).includes('KNOWLEDGE_WHEEL_TOKEN_719'));
+ assert.deepEqual(reply.data.injected_ids,[docId]);assert.equal(c.messages[1].references[0].id,docId);
+ const retry=await h.request('/api/chat','POST',data);assert.deepEqual(retry.data.injected_ids,[docId]);assert.equal(h.calls.length,1);
+ const cleared=await h.request('/api/conversations/'+c.id,'PATCH',{revision:c.revision,source_ids:[]});c=cleared.data.conversation;
+ const next=await h.request('/api/chat','POST',{...data,request_id:randomUUID(),revision:c.revision,message:'Now continue without that document.'});
+ assert.equal(next.status,200);assert.deepEqual(next.data.injected_ids,[]);assert(!JSON.stringify(h.calls.at(-1)?.body).includes('KNOWLEDGE_WHEEL_TOKEN_719'));
+ // Revalidate reference visibility on every model call, including document generation.
+ c=next.data.conversation;c=(await h.request('/api/conversations/'+c.id,'PATCH',{revision:c.revision,source_ids:[docId]})).data.conversation;
+ await h.pool.query("UPDATE explorations SET status='draft' WHERE id=$1",[docId]);
+ const beforeCalls=h.calls.length;
+ assert.equal((await h.request('/api/chat','POST',{conversation_id:c.id,revision:c.revision,request_id:randomUUID(),action:'document'})).status,404);
+ assert.equal(h.calls.length,beforeCalls);
+});
