@@ -20,7 +20,7 @@ export const clientHelpers = String.raw`
     }
   };
   const api = async (path, method = 'GET', data) => {
-    const response = await fetch(path, {method, credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, ...(data === undefined ? {} : {body: JSON.stringify(data)})});
+    const response = await fetch(path, {method, ...(method === 'GET' ? {signal: AbortSignal.timeout(15000)} : {}), credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, ...(data === undefined ? {} : {body: JSON.stringify(data)})});
     const result = await response.json().catch(() => null);
     if (!response.ok) throw new Error(result && result.error && result.error.message || (response.status === 401 ? 'Your session has expired. Please sign in again.' : 'The request failed. Please try again.'));
     if (!result) throw new Error('The server returned an unexpected response. Please try again.');
