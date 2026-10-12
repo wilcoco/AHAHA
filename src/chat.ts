@@ -28,6 +28,10 @@ export async function initChatDb(q: Query) {
       provider text NOT NULL DEFAULT 'auto'
         CHECK (provider IN ('auto','hosted_openai','hosted_anthropic','byok_openai','byok_anthropic'))
     );
+    ALTER TABLE user_llm_settings ADD COLUMN IF NOT EXISTS system_prompt text NOT NULL DEFAULT '';
+    ALTER TABLE user_llm_settings ADD COLUMN IF NOT EXISTS fork_setup text NOT NULL DEFAULT 'own';
+    CREATE TABLE IF NOT EXISTS llm_usage (id uuid PRIMARY KEY DEFAULT gen_random_uuid(),user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,conversation_id uuid,action text NOT NULL,provider text NOT NULL,model text NOT NULL,input_tokens integer,output_tokens integer,created_at timestamptz NOT NULL DEFAULT now());
+    CREATE INDEX IF NOT EXISTS llm_usage_owner_idx ON llm_usage(user_id,created_at DESC);
     CREATE TABLE IF NOT EXISTS user_chat_rate_limits (
       user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       window_start timestamptz NOT NULL,
@@ -98,7 +102,7 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
   const active = new Set<string>();
   async function settings(userId: string) {
     const keys = (await q("SELECT provider,last4 FROM user_llm_keys WHERE user_id=$1", [userId])).rows;
-    const preference = (await q("SELECT provider FROM user_llm_settings WHERE user_id=$1", [userId])).rows[0];
+    const preference = (await q("SELECT * FROM user_llm_settings WHERE user_id=$1", [userId])).rows[0];
     const keyStatus = (provider: Provider) => {
       const key = keys.find(row => row.provider === provider);
       return { configured: !!key, last4: key?.last4 || null };
@@ -106,12 +110,12 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
     return {
       hosted: hostedStatus(env),
       byok: { enabled: masterKeyConfigured(env), openai: keyStatus("openai"), anthropic: keyStatus("anthropic") },
-      provider: preference?.provider || "auto"
+      provider: preference?.provider || "auto", system_prompt:preference?.system_prompt||"", fork_setup:preference?.fork_setup||"own"
     };
   }
 
   return async function handleChatApi(req: IncomingMessage, res: ServerResponse, pathname: string, origin: string) {
-    const isWorkspace = pathname.startsWith("/api/conversations") || pathname.startsWith("/api/explorations/") || pathname.startsWith("/api/support/");
+    const isWorkspace = pathname.startsWith("/api/community/") || pathname.startsWith("/api/conversations") || pathname.startsWith("/api/explorations/") || pathname.startsWith("/api/support/");
     if (pathname !== "/api/chat" && !pathname.startsWith("/api/llm/") && !isWorkspace) return false;
     try {
       // Web sessions only: MCP/OAuth credentials never authorize spending or managing LLM keys.
@@ -129,11 +133,17 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
       if (pathname === "/api/llm/settings" && req.method === "GET") {
         json(res, 200, await settings(user.id));
       } else if (pathname === "/api/llm/settings" && req.method === "PUT") {
-        const data = await readJson(req, 1024);
+        const data = await readJson(req, 30000);
         const provider = selection(data.provider);
-        await q(`INSERT INTO user_llm_settings(user_id,provider) VALUES($1,$2)
-          ON CONFLICT(user_id) DO UPDATE SET provider=EXCLUDED.provider`, [user.id, provider]);
+        const old=await settings(user.id);
+        const prompt=data.system_prompt??old.system_prompt,setup=data.fork_setup??old.fork_setup;
+        if(typeof prompt!=='string'||prompt.length>6000||!['own','author'].includes(String(setup)))throw new AppError(400,'invalid_settings','지침은 6,000자 이내이며 분기 설정을 선택해야 합니다.');
+        await q(`INSERT INTO user_llm_settings(user_id,provider,system_prompt,fork_setup) VALUES($1,$2,$3,$4)
+          ON CONFLICT(user_id) DO UPDATE SET provider=EXCLUDED.provider,system_prompt=EXCLUDED.system_prompt,fork_setup=EXCLUDED.fork_setup`, [user.id, provider,prompt,setup]);
         json(res, 200, { provider });
+      } else if(pathname==='/api/llm/usage'&&req.method==='GET'){
+        const rows=(await q('SELECT action,provider,model,input_tokens,output_tokens,created_at FROM llm_usage WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100',[user.id])).rows;
+        json(res,200,{usage:rows});
       } else if (/^\/api\/llm\/keys\/(openai|anthropic)$/.test(pathname) && ["PUT", "DELETE"].includes(req.method || "")) {
         const provider = pathname.split("/").at(-1) as Provider;
         if (req.method === "DELETE") {
@@ -158,7 +168,7 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
         }
         const messages = validateMessages(prepared ? prepared.messages : data.messages);
         const current = await settings(user.id);
-        const requested = data.provider === undefined ? current.provider : selection(data.provider);
+        const requested = data.provider === undefined ? (prepared?.row.preferred_provider||current.provider) : selection(data.provider);
         const provider = resolveProvider(requested, {
           openai: current.byok.enabled && current.byok.openai.configured,
           anthropic: current.byok.enabled && current.byok.anthropic.configured
@@ -187,6 +197,7 @@ export function createChatApi({ q, authenticate, env = process.env, fetchImpl = 
           }
           const result = await callProvider(provider, messages, apiKey, env, fetchImpl);
           const conversation = prepared ? await workspace!.finish(user.id,prepared,result) : undefined;
+          await q('INSERT INTO llm_usage(user_id,conversation_id,action,provider,model,input_tokens,output_tokens) VALUES($1,$2,$3,$4,$5,$6,$7)',[user.id,prepared?.row.id||null,prepared?.action==='document'?'document':'chat',result.provider,result.model,result.usage.input_tokens,result.usage.output_tokens]);
           locked = false;
           json(res, 200, { provider: result.provider, model: result.model, message: { role: "assistant", content: result.content }, ...(conversation ? {conversation,injected_ids:prepared?.injected?.map((r:any)=>r.id)||[]} : {}) });
         } finally {

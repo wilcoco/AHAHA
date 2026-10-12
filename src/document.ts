@@ -21,6 +21,7 @@ export function documentRendererScript(){return '(function(){const __name=(fn)=>
 
 export function legacyDocument(e:any): string {
   if(e.document_body?.trim())return e.document_body;
+  if(e.source_platform==='Exploration Chat'&&!e.starting_view&&!e.current_view)return '';
   const sections=[['질문',e.opening_question],['시작 관점',e.starting_view],['핵심 논점',(e.key_turns||[]).join('\n\n')],['전환점',(e.turning_points||[]).join('\n\n')],['현재의 생각',e.current_view]];
   return '# '+e.title+'\n\n'+sections.filter(([,body])=>body).map(([title,body])=>'## '+title+'\n\n'+body).join('\n\n');
 }

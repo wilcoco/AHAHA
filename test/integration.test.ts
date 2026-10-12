@@ -344,6 +344,12 @@ test("real server preserves sign-in, OAuth PKCE, and private Exploration MCP wor
   const fetched = await rpc("tools/call", { name: "get_exploration", arguments: { id_or_slug: exploration.id } });
   assert.equal(fetched.result.structuredContent.result.exploration.id, exploration.id);
   assert.equal((await fetch(origin + "/@" + username + "/" + exploration.slug)).status, 404);
+  await rpc('tools/call',{name:'publish_exploration',arguments:{id_or_slug:exploration.id}});
+  const appended=await rpc('tools/call',{name:'append_exploration',arguments:{id_or_slug:exploration.id,current_view:'A new perspective',source_messages:[{role:'user',content:'A follow-up'}]}});
+  const revision=appended.result.structuredContent.result;
+  assert.notEqual(revision.id,exploration.id);assert.equal(revision.status,'draft');assert.equal(revision.parent_id,exploration.id);
+  const original=(await rpc('tools/call',{name:'get_exploration',arguments:{id_or_slug:exploration.id}})).result.structuredContent.result;
+  assert.equal(original.exploration.current_view,'');assert.equal(original.source_messages.length,0);
 });
 
 
@@ -397,7 +403,7 @@ test("references respect visibility and draft publishing snapshots the reviewed 
  assert.match(JSON.stringify(h.calls[0].body.input),/Reference insight/);
  assert(!JSON.stringify(h.calls[0].body.input).includes('Private insight'));
  assert.equal(reply.data.conversation.sources[0].id,publicId);
- assert.equal((await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:1})).status,400);
+ assert.equal((await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:1})).status,201);
  const reflection={starting_view:'I was uncertain.',turning_points:'I considered the source.\nI tested an alternative.',current_view:'My own view.'};
  const revised=(await h.request('/api/conversations/'+created.id,'PATCH',{revision:1,title:'A reviewed exploration',reflection})).data.conversation;
  const draft=await h.request('/api/conversations/'+created.id+'/draft','POST',{revision:revised.revision});
@@ -559,4 +565,83 @@ test('a saved knowledge document reaches the next model request and its source i
  const beforeCalls=h.calls.length;
  assert.equal((await h.request('/api/chat','POST',{conversation_id:c.id,revision:c.revision,request_id:randomUUID(),action:'document'})).status,404);
  assert.equal(h.calls.length,beforeCalls);
+});
+
+test('conversation-only publication projects redactions to readers, search and forks without changing the private original',options,async t=>{
+ const h=await harness(t);
+ const c=(await h.request('/api/conversations','POST',{import_text:'PUBLIC_QUESTION\n>>>>>\nAnswer SECRET_REDAC123\n>>>>>\nOMITTED_456\n>>>>>\nLAST_SECRET_789',source_platform:'Synthetic fixture'})).data.conversation;
+ assert.equal(c.messages.length,4);assert(c.messages.every((m:any)=>m.id));
+ const saved=await h.request('/api/conversations/'+c.id+'/draft','POST',{revision:c.revision});assert.equal(saved.status,201);
+ const id=saved.data.id;
+ assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,'bob')).status,404);
+ const data={title:'Reviewed conversation',messages:c.messages.slice(0,2).map((m:any)=>({id:m.id,content:m.content.replace('SECRET_REDAC123','[가림]')})),include_document:false};
+ assert.equal((await h.request('/api/explorations/'+id+'/publish','POST',data)).status,200);
+ const published=await h.request('/api/explorations/'+id,'GET',undefined,null);
+ assert.equal(published.data.messages.length,2);assert.equal(published.data.exploration.document_body,'');
+ for(const secret of ['SECRET_REDAC123','OMITTED_456','LAST_SECRET_789'])assert(!published.text.includes(secret));
+ assert.equal((await h.request('/api/explorations/search?q=OMITTED_456','GET',undefined,null)).data.explorations.length,0);
+ const fork=(await h.request('/api/explorations/'+id+'/branch','POST',{mode:'continue',message_id:c.messages[1].id},'bob')).data.conversation;
+ assert(!JSON.stringify(fork).includes('SECRET_REDAC123'));assert.equal(fork.base_messages.length,2);
+ const original=(await h.request('/api/conversations/'+c.id)).data.conversation;assert.match(original.messages[1].content,/SECRET_REDAC123/);assert.equal(original.messages.length,4);
+ assert.equal((await h.request('/api/explorations/'+id+'/publish','POST',data)).status,409);
+ assert.equal((await h.request('/api/conversations/'+c.id+'/export','GET',undefined,'bob')).status,404);
+});
+
+test('quote and regenerate preserve stable anchors and early branch context reaches inference',options,async t=>{
+ const h=await harness(t);
+ await h.request('/api/llm/settings','PUT',{provider:'hosted_openai',system_prompt:'OWN_INSTRUCTION',fork_setup:'own'});
+ const text=Array.from({length:6},(_,i)=>'Q'+i+' '+(i===0?'EARLIEST_IMPORTANT_CONDITION':'question')+'\n>>>>>\nA'+i+' answer').join('\n>>>>>\n');
+ const c=(await h.request('/api/conversations','POST',{import_text:text,source_platform:'Fixture'})).data.conversation;
+ assert.equal(c.system_prompt,'OWN_INSTRUCTION');
+ const branch=async(mode:string,index:number)=>h.request('/api/conversations/'+c.id+'/branch','POST',{revision:0,mode,message_id:c.messages[index].id,message_index:index});
+ const continued=(await branch('continue',11)).data.conversation;
+ const response=await h.request('/api/chat','POST',{conversation_id:continued.id,revision:0,request_id:randomUUID(),message:'continue'});assert.equal(response.status,200);
+ assert.match(JSON.stringify(h.calls.at(-1)?.body),/EARLIEST_IMPORTANT_CONDITION/);
+ const quote=(await branch('quote',3)).data.conversation;assert.equal(quote.base_messages.length,0);assert.equal(quote.document_body,'');
+ await h.request('/api/chat','POST',{conversation_id:quote.id,revision:0,request_id:randomUUID(),message:'quote question'});
+ const request=JSON.stringify(h.calls.at(-1)?.body);assert.match(request,/A1 answer/);assert(!request.includes('EARLIEST_IMPORTANT_CONDITION'));assert(!request.includes('A2 answer'));
+ const regenerated=(await branch('regenerate',3)).data.conversation;assert.equal(regenerated.base_messages.length,2);assert.equal(regenerated.input_draft,'Q1 question');
+ assert.equal((await h.request('/api/conversations/'+c.id+'/branch','POST',{revision:0,mode:'continue',message_id:c.messages[3].id,message_index:1})).status,409);
+ assert.equal((await h.request('/api/conversations/'+c.id)).data.conversation.messages.length,12);
+ const usage=await h.request('/api/llm/usage');assert.equal(usage.data.usage.length,2);assert.equal((await h.request('/api/llm/usage','GET',undefined,'bob')).data.usage.length,0);
+});
+
+test('private bookmarks, subscriptions and published fork notifications respect ownership',options,async t=>{
+ const h=await harness(t);
+ assert.equal((await h.request('/api/community/follow/alice','PUT',{},'bob')).status,200);
+ const c=(await h.request('/api/conversations','POST',{import_text:'Community question\n>>>>>\nAn answer',source_platform:'Fixture'})).data.conversation;
+ const id=(await h.request('/api/conversations/'+c.id+'/draft','POST',{revision:0})).data.id;
+ assert.equal((await h.request('/api/community/bookmark/'+id,'PUT',{},'bob')).status,404);
+ assert.equal((await h.request('/api/community/bookmark/'+id,'PUT',{})).status,200);
+ assert.equal((await h.request('/api/explorations/search?scope=saved')).data.explorations.length,1);
+ assert.equal((await h.request('/api/explorations/search?scope=saved','GET',undefined,'bob')).data.explorations.length,0);
+ await h.request('/api/explorations/'+id+'/publish','POST',{});
+ assert.equal((await h.request('/api/explorations/search?scope=following','GET',undefined,'bob')).data.explorations.length,1);
+ let alerts=(await h.request('/api/community/notifications','GET',undefined,'bob')).data.notifications;assert.equal(alerts.length,1);
+ await h.request('/api/community/notifications/read','POST',{id:alerts[0].id});
+ assert.equal((await h.request('/api/community/notifications','GET',undefined,'bob')).data.notifications[0].read_at,null);
+ const fork=(await h.request('/api/explorations/'+id+'/branch','POST',{kind:'fork'},'bob')).data.conversation;
+ const child=(await h.request('/api/conversations/'+fork.id+'/draft','POST',{revision:0},'bob')).data.id;
+ assert.equal((await h.request('/api/community/notifications')).data.notifications.length,0);
+ await h.request('/api/explorations/'+child+'/publish','POST',{},'bob');
+ alerts=(await h.request('/api/community/notifications')).data.notifications;assert.equal(alerts[0].kind,'fork');assert.equal(alerts[0].exploration_id,child);
+});
+
+test('invited sharing stays out of public discovery and derived branches cannot widen the audience',options,async t=>{
+ const h=await harness(t);
+ const c=(await h.request('/api/conversations','POST',{import_text:'TEAM_ONLY_119\n>>>>>\nPrivate team answer',source_platform:'Fixture'})).data.conversation;
+ const id=(await h.request('/api/conversations/'+c.id+'/draft','POST',{revision:0})).data.id;
+ const shared=await h.request('/api/explorations/'+id+'/publish','POST',{visibility:'invited',readers:['bob'],include_document:false});assert.equal(shared.status,200);assert.equal(shared.data.url,'/chat?exploration='+id);
+ assert.equal((await h.request('/api/explorations/'+id,'GET',undefined,null)).status,404);
+ assert.equal((await h.request('/api/explorations/search?q=TEAM_ONLY_119','GET',undefined,null)).data.explorations.length,0);
+ const detail=await h.request('/api/explorations/'+id,'GET',undefined,'bob');assert.equal(detail.status,200);assert.equal(detail.data.exploration.audience_limit,undefined);
+ assert.equal((await h.request('/api/explorations/search?scope=shared','GET',undefined,'bob')).data.explorations.length,1);
+ const fork=(await h.request('/api/explorations/'+id+'/branch','POST',{kind:'fork'},'bob')).data.conversation;
+ const child=(await h.request('/api/conversations/'+fork.id+'/draft','POST',{revision:0},'bob')).data.id;
+ assert.equal((await h.request('/api/explorations/'+child+'/publish','POST',{},'bob')).status,403);
+ assert.equal((await h.request('/api/explorations/'+child+'/publish','POST',{visibility:'invited',readers:['alice']},'bob')).status,200);
+ const reference=(await h.request('/api/conversations','POST',{source_ids:[id]},'bob')).data.conversation;
+ const answer=(await h.request('/api/chat','POST',{conversation_id:reference.id,revision:0,request_id:randomUUID(),message:'summarize'},'bob')).data.conversation;
+ const derived=(await h.request('/api/conversations/'+reference.id+'/draft','POST',{revision:answer.revision},'bob')).data.id;
+ assert.equal((await h.request('/api/explorations/'+derived+'/publish','POST',{},'bob')).status,403);
 });

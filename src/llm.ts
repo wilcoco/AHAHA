@@ -202,7 +202,7 @@ export async function callProvider(
   apiKey: string | undefined,
   env: Env = process.env,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ provider: ResolvedChatProvider; model: string; content: string }> {
+): Promise<{ provider: ResolvedChatProvider; model: string; content: string; usage:{input_tokens:number|null;output_tokens:number|null} }> {
   if (!VALID_PROVIDERS.includes(provider)) throw new AppError(400, "invalid_provider", "Choose a supported chat provider.");
   const validated = validateMessages(messages);
   const vendor: Provider = provider.endsWith("openai") ? "openai" : "anthropic";
@@ -248,7 +248,9 @@ export async function callProvider(
       content = data.content.map((part: any) => part?.type === "text" && typeof part.text === "string" ? part.text : "").join("");
     }
     if (!content.trim()) throw new AppError(502, "empty_provider_response", "The provider returned no text. Please try again.");
-    return { provider, model, content };
+    const usage=data?.usage as any;
+    const tokens=(n:unknown)=>Number.isInteger(n)&&Number(n)>=0&&Number(n)<=2147483647?Number(n):null;
+    return { provider, model, content,usage:{input_tokens:tokens(usage?.input_tokens),output_tokens:tokens(usage?.output_tokens)} };
   } catch (error) {
     if (controller.signal.aborted) throw new AppError(504, "provider_timeout", "The provider took too long to respond. Please try again.");
     if (error instanceof AppError) throw error;

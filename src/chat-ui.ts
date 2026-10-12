@@ -33,10 +33,11 @@ export function settingsPanel(): string {
   <h2 id="llm-settings-title">AI settings</h2><p class="llm-help">Chat with a hosted model or use your own provider account.</p>
   <div class="llm-grid"><div class="llm-box"><h3>OpenAI hosted</h3><div id="hosted-openai-status" class="llm-status">Checking configuration…</div></div><div class="llm-box"><h3>Anthropic hosted</h3><div id="hosted-anthropic-status" class="llm-status">Checking configuration…</div></div></div>
   <hr class="llm-divider"><h3>Your API keys</h3><p class="llm-help">Keys are encrypted before storage. Only the last four characters are shown. Your provider bills usage to your account.</p><p id="byok-availability" class="llm-help"></p>
-  <div class="llm-grid">${["openai", "anthropic"].map(name => `<form id="key-${name}-form" class="llm-box"><h3>${name === "openai" ? "OpenAI" : "Anthropic"}</h3><div id="key-${name}-status" class="llm-status">Checking saved key…</div><label class="llm-field" for="key-${name}-input">New API key<input id="key-${name}-input" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="1024" placeholder="Paste API key" disabled required></label><div class="llm-actions"><button class="btn" id="key-${name}-save" type="submit" disabled>Save key</button><button class="llm-secondary" id="key-${name}-delete" type="button" disabled>Delete</button></div><p id="key-${name}-notice" class="llm-notice" role="status" aria-live="polite"></p></form>`).join("")}</div>
-  <hr class="llm-divider"><form id="llm-provider-form"><label class="llm-field" for="llm-provider">Default chat provider<select id="llm-provider" disabled>${providerOptions}</select></label><p class="llm-help">Auto uses a configured hosted provider first, then an available saved key.</p><div class="llm-actions"><button id="llm-provider-save" class="btn" type="submit" disabled>Save preference</button><a href="/chat" class="llm-link">Open chat →</a></div></form><p id="llm-settings-notice" class="llm-notice" role="status" aria-live="polite">Loading AI settings…</p>
-  </section><script>(() => {
+  <div class="llm-grid">${["openai", "anthropic"].map(name => `<form id="key-${name}-form" class="llm-box"><h3>${name === "openai" ? "OpenAI" : "Anthropic"}</h3><div id="key-${name}-status" class="llm-status">Checking saved key…</div><label class="llm-field" for="key-${name}-input">New API key<input id="key-${name}-input" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="1024" placeholder="Paste API key" disabled required></label><div class="llm-actions"><button class="btn" id="key-${name}-save" type="submit" disabled>Save key</button><button class="llm-secondary" id="key-${name}-delete" type="button" disabled>Delete</button><button class="llm-secondary" id="key-${name}-test" type="button" disabled>연결 검사 · 짧은 유료 호출</button></div><p id="key-${name}-notice" class="llm-notice" role="status" aria-live="polite"></p></form>`).join("")}</div>
+  <hr class="llm-divider"><form id="llm-provider-form"><label class="llm-field" for="llm-provider">Default chat provider<select id="llm-provider" disabled>${providerOptions}</select></label><p class="llm-help">Auto uses a configured hosted provider first, then an available saved key. A failed request never switches billing accounts automatically.</p><label class="llm-field">새 대화의 기본 지침<textarea id="default-system-prompt" maxlength="6000" rows="5" placeholder="답변 언어, 설명 방식, 작업 목적"></textarea></label><label class="llm-field">포크 시작 설정<select id="default-fork-setup"><option value="own">내 기본 지침</option><option value="author">작성자의 대화 지침</option></select></label><p class="llm-help">새 대화부터 적용합니다. 포크마다 바꿀 수 있으며 API 키는 상속하지 않습니다.</p><div class="llm-actions"><button id="llm-provider-save" class="btn" type="submit" disabled>Save preference</button><a href="/chat" class="llm-link">Open chat →</a></div></form><p id="llm-settings-notice" class="llm-notice" role="status" aria-live="polite">Loading AI settings…</p>
+  <hr class="llm-divider"><h3>AI 사용 내역</h3><p class="llm-help">대화와 문서 정리를 구분합니다. 개인 키 비용은 공급사에 청구됩니다. 지지 포인트와 별개이며 토큰 미제공은 0으로 표시하지 않습니다.</p><button type="button" class="llm-secondary" id="refresh-usage">사용 내역 보기</button><div id="usage-list" role="status"></div></section><script>(() => {
   ${clientHelpers}
+  document.getElementById('refresh-usage').onclick=async()=>{const host=document.getElementById('usage-list');try{const r=await api('/api/llm/usage');host.replaceChildren();if(!r.usage.length)host.textContent='기록된 사용 내역이 없습니다.';for(const u of r.usage){const row=document.createElement('p');row.textContent=new Date(u.created_at).toLocaleString()+' · '+(u.action==='document'?'문서 정리':'대화')+' · '+u.provider+' / '+u.model+' · 입력 '+(u.input_tokens??'미제공')+' / 출력 '+(u.output_tokens??'미제공')+' 토큰';host.append(row);}}catch(e){host.textContent=e.message;}};
   const select = document.getElementById('llm-provider');
   const status = document.getElementById('llm-settings-notice');
   const busyProviders = new Set();
@@ -50,13 +51,13 @@ export function settingsPanel(): string {
       hostedStatus.dataset.configured = String(hosted.configured);
       const saved = settings.byok[provider];
       const keyStatus = document.getElementById('key-' + provider + '-status');
-      keyStatus.textContent = saved.configured ? 'Saved · ending in ' + saved.last4 : 'No key saved';
+      keyStatus.textContent = saved.configured ? 'Saved (not connection-tested) · ending in ' + saved.last4 : 'No key saved';
       keyStatus.dataset.configured = String(saved.configured);
       const busy = busyProviders.has(provider);
       document.getElementById('key-' + provider + '-input').disabled = busy || !settings.byok.enabled;
       document.getElementById('key-' + provider + '-save').disabled = busy || !settings.byok.enabled;
       document.getElementById('key-' + provider + '-save').textContent = busy ? 'Working…' : saved.configured ? 'Replace key' : 'Save key';
-      document.getElementById('key-' + provider + '-delete').disabled = busy || !saved.configured;
+      document.getElementById('key-' + provider + '-delete').disabled = busy || !saved.configured;document.getElementById('key-'+provider+'-test').disabled=busy||!saved.configured||!settings.byok.enabled;
     }
     document.getElementById('byok-availability').textContent = settings.byok.enabled ? '' : 'Saving and using keys is unavailable until the service owner configures BYOK encryption.';
     fillProviders(select, settings);
@@ -80,6 +81,7 @@ export function settingsPanel(): string {
       } catch (error) { notice(keyNotice, error.message, true); }
       finally { busyProviders.delete(provider); render(); }
     };
+    document.getElementById('key-'+provider+'-test').onclick=async()=>{busyProviders.add(provider);render();notice(keyNotice,'연결 확인 중…');try{const r=await api('/api/chat','POST',{provider:'byok_'+provider,messages:[{role:'user',content:'Reply with OK only.'}]});notice(keyNotice,'연결 확인 성공 · '+r.model);}catch(e){notice(keyNotice,e.message,true);}finally{busyProviders.delete(provider);render();}};
     document.getElementById('key-' + provider + '-form').addEventListener('submit', event => { event.preventDefault(); void changeKey('PUT'); });
     document.getElementById('key-' + provider + '-delete').addEventListener('click', () => { void changeKey('DELETE'); });
   }
@@ -87,11 +89,11 @@ export function settingsPanel(): string {
     event.preventDefault();
     if (!settings || savingPreference) return;
     savingPreference = true; render(); notice(status, 'Saving preference…');
-    try { await api('/api/llm/settings', 'PUT', {provider: select.value}); await refresh(); select.value = settings.provider; notice(status, 'Default provider saved.'); }
+    try { await api('/api/llm/settings', 'PUT', {provider: select.value,system_prompt:document.getElementById('default-system-prompt').value,fork_setup:document.getElementById('default-fork-setup').value}); await refresh(); select.value = settings.provider; notice(status, 'Default provider saved.'); }
     catch (error) { notice(status, error.message, true); }
     finally { savingPreference = false; render(); }
   });
-  refresh().then(() => { select.value = settings.provider; notice(status, ''); }).catch(error => notice(status, error.message, true));
+  refresh().then(() => { document.getElementById('default-system-prompt').value=settings.system_prompt;document.getElementById('default-fork-setup').value=settings.fork_setup;select.value = settings.provider; notice(status, ''); }).catch(error => notice(status, error.message, true));
   })();</script>`;
 }
 

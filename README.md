@@ -243,3 +243,15 @@ Provider unit tests use mocked HTTP responses; they do not spend tokens or need 
 ## Stack
 
 Node.js 22 + TypeScript + PostgreSQL + server-rendered HTML/CSS.
+
+## Conversation-first publishing and reader workflows
+
+The workspace now supports publishing a conversation without a document. Use **대화 발행 검토** to select messages, mask selected text, edit the title/author note, and inspect the reader preview. Documents and system instructions are opt-in attachments; the private working conversation is retained. Choose **모두에게 공개** or **초대한 사람만** (up to 20 existing usernames). Restricted forks and reference-based drafts cannot publish outside their inherited audience. Recipients use **받은 글**; private working forks never create public activity.
+
+Each question supports rewriting into a branch. Each answer supports continuing, quoting only that answer, or preparing an alternative reply. Stable message links and the version comparison retain provenance. Long inherited contexts now fail explicitly at the size limit rather than silently dropping earlier conditions. **대화 가져오기** accepts alternating questions/answers separated by a `>>>>>` line; **내보내기** exports the owner's conversation JSON.
+
+Settings support default instructions, default fork setup, a short paid BYOK connection test, and separate chat/document token usage. Automatic document generation is off initially to avoid unexpected extra calls. Saved items, creator subscriptions and publication/fork/invitation notifications are available in the workspace. Point support remains independent of inference usage and has no cash value.
+
+MCP `append_exploration` now returns a **new private revision ID**; use that returned ID for subsequent operations. Existing public snapshots cannot be overwritten through MCP publish. Additive database migrations run at startup; no new environment variables or external services are required. Existing `BYOK_MASTER_KEY` must remain unchanged; a missing master key still disables key storage and use.
+
+See [reference coverage and boundaries](docs/lagora-adaptation.md). Invited sharing is not a substitute for company administration, offboarding, or enterprise identity management.

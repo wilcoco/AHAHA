@@ -118,7 +118,7 @@ test("OpenAI uses Responses with stateless messages and bounded output", async (
     assert.deepEqual(JSON.parse(String(init?.body)), { model: "gpt-4.1-mini", input: history, store: false, max_output_tokens: 2048 });
     return new Response(JSON.stringify({ output: [{ type: "reasoning", summary: [] }, { type: "message", role: "assistant", content: [{ type: "output_text", text: "Hello" }, { type: "output_text", text: " there" }] }] }));
   }) as typeof fetch;
-  assert.deepEqual(await callProvider("hosted_openai", history, undefined, { HOSTED_OPENAI_API_KEY: TEST_KEY }, fake), { provider: "hosted_openai", model: "gpt-4.1-mini", content: "Hello there" });
+  assert.deepEqual(await callProvider("hosted_openai", history, undefined, { HOSTED_OPENAI_API_KEY: TEST_KEY }, fake), { provider: "hosted_openai", model: "gpt-4.1-mini", content: "Hello there", usage:{input_tokens:null,output_tokens:null} });
 });
 
 test("Anthropic separates system messages and sends required authentication/version", async () => {
@@ -132,7 +132,7 @@ test("Anthropic separates system messages and sends required authentication/vers
     assert.deepEqual(JSON.parse(String(init?.body)), { model: "claude-haiku-4-5-20251001", system: "Be concise\n\nUse Korean", messages, max_tokens: 2048 });
     return new Response(JSON.stringify({ content: [{ type: "thinking", thinking: "private" }, { type: "text", text: "안녕하세요" }] }));
   }) as typeof fetch;
-  assert.deepEqual(await callProvider("byok_anthropic", history, TEST_KEY, {}, fake), { provider: "byok_anthropic", model: "claude-haiku-4-5-20251001", content: "안녕하세요" });
+  assert.deepEqual(await callProvider("byok_anthropic", history, TEST_KEY, {}, fake), { provider: "byok_anthropic", model: "claude-haiku-4-5-20251001", content: "안녕하세요", usage:{input_tokens:null,output_tokens:null} });
 });
 
 test("BYOK honors model configuration and requires the supplied personal key", async () => {

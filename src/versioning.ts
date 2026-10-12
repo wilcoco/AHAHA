@@ -1,12 +1,18 @@
 import { AppError } from './llm.js';
 
 export function branchPoint(messages:any[], data:Record<string,unknown>){
-  const index=data.message_index,mode=data.mode;
-  if(!Number.isInteger(index)||Number(index)<0||Number(index)>=messages.length||!['rewrite','continue'].includes(String(mode)))throw new AppError(400,'invalid_branch_point','분기할 질문이나 답변을 선택하세요.');
+  const mode=String(data.mode);
+  const index=data.message_id!==undefined?messages.findIndex(m=>m.id===data.message_id):data.message_index;
+  if(!Number.isInteger(index)||Number(index)<0||Number(index)>=messages.length||!['rewrite','continue','quote','regenerate'].includes(mode))throw new AppError(400,'invalid_branch_point','분기할 질문이나 답변을 선택하세요.');
+  if(data.message_id!==undefined&&data.message_index!==undefined&&data.message_index!==index)throw new AppError(409,'branch_changed','선택한 문답이 변경됐습니다. 다시 열어 주세요.');
   const message=messages[Number(index)];
-  if(mode==='rewrite'&&message.role!=='user'||mode==='continue'&&message.role!=='assistant')throw new AppError(400,'invalid_branch_point','질문은 고쳐 묻기, 답변은 이어 쓰기를 선택하세요.');
-  const count=Number(index)+(mode==='continue'?1:0);
-  return {messages:messages.slice(0,count),input:mode==='rewrite'?message.content:'',anchor:{message_index:Number(index),mode,inherited_count:count,excerpt:message.content.slice(0,240)}};
+  if(mode==='rewrite'&&message.role!=='user'||mode!=='rewrite'&&message.role!=='assistant')throw new AppError(400,'invalid_branch_point','질문이나 답변에 맞는 작업을 선택하세요.');
+  let count=Number(index)+(mode==='continue'?1:0),input=mode==='rewrite'?message.content:'';
+  if(mode==='regenerate'){
+    if(Number(index)<1||messages[Number(index)-1].role!=='user')throw new AppError(400,'invalid_branch_point','이 답변 앞의 질문을 찾을 수 없습니다.');
+    count=Number(index)-1;input=messages[count].content;
+  }
+  return {messages:mode==='quote'?[]:messages.slice(0,count),input,anchor:{message_id:message.id,message_index:Number(index),mode,inherited_count:mode==='quote'?0:count,excerpt:message.content.slice(0,240),...(mode==='quote'?{quote:message.content}:{})}};
 }
 
 export type DiffRow={kind:'same'|'add'|'remove';text:string;before:number|null;after:number|null};

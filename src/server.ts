@@ -230,24 +230,28 @@ async function searchPublic(term: string) {
 async function appendExploration(userId: string, a: any) {
   const item = await getMine(userId,a.id_or_slug);
   if (!item) throw new Error("exploration not found");
-  const turns=[...(item.key_turns||[]),...(a.key_turns||[])];
-  const points=[...(item.turning_points||[]),...(a.turning_points||[])];
-  await q("UPDATE explorations SET key_turns=$1::jsonb,turning_points=$2::jsonb,current_view=COALESCE($3,current_view),updated_at=now() WHERE id=$4",
-    [JSON.stringify(turns),JSON.stringify(points),a.current_view??null,item.id]);
-  if (Array.isArray(a.source_messages) && a.source_messages.length) {
-    const r=await q("SELECT COALESCE(MAX(position),-1)+1 n FROM source_messages WHERE exploration_id=$1",[item.id]);
-    let p=Number(r.rows[0].n);
-    for (const m of a.source_messages) {
-      await q("INSERT INTO source_messages(id,exploration_id,position,role,content) VALUES($1,$2,$3,$4,$5)",
-        [crypto.randomUUID(),item.id,p++,m.role||"other",String(m.content||"")]);
-    }
-  }
-  return getMine(userId,item.id);
+  const id=crypto.randomUUID();const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`INSERT INTO explorations(id,user_id,slug,title,opening_question,starting_view,key_turns,turning_points,current_view,source_platform,source_model,status,document_body,topic,parent_id,root_id,relation_kind,version_number,system_prompt,audience_limit)
+      SELECT $2,user_id,$3,title,opening_question,starting_view,$4::jsonb,$5::jsonb,COALESCE($6,current_view),source_platform,source_model,'draft',document_body,topic,id,COALESCE(root_id,id),'revision',version_number+1,system_prompt,audience_limit FROM explorations WHERE id=$1 AND user_id=$7`,
+      [item.id,id,'exploration-'+id.slice(0,12),JSON.stringify([...(item.key_turns||[]),...(a.key_turns||[])]),JSON.stringify([...(item.turning_points||[]),...(a.turning_points||[])]),a.current_view??null,userId]);
+    await client.query(`INSERT INTO source_messages(id,exploration_id,position,role,content,message_id,metadata,references_used) SELECT gen_random_uuid(),$2,position,role,content,COALESCE(message_id,id),metadata,references_used FROM source_messages WHERE exploration_id=$1`,[item.id,id]);
+    let position=Number((await client.query('SELECT COALESCE(MAX(position),-1)+1 n FROM source_messages WHERE exploration_id=$1',[id])).rows[0].n);
+    for(const m of Array.isArray(a.source_messages)?a.source_messages:[])await client.query('INSERT INTO source_messages(id,exploration_id,position,role,content,message_id) VALUES($1,$2,$3,$4,$5,$1)',[crypto.randomUUID(),id,position++,m.role||'other',String(m.content||'')]);
+    await client.query('COMMIT');
+  }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+  return getMine(userId,id);
 }
 
 async function publishExploration(userId: string, a: any, origin: string) {
   const item = await getMine(userId,a.id_or_slug);
   if (!item) throw new Error("exploration not found");
+  if(item.audience_limit)throw new Error('Restricted shared content cannot be published publicly. Use the invited-reader workflow.');
+  if(item.status==='published'){
+    if(['title','opening_question','starting_view','current_view'].some(k=>a[k]!==undefined&&a[k]!==item[k]))throw new Error('Published versions are immutable. Use append_exploration to create a private revision first.');
+    return {...item,public_url:origin+'/@'+item.username+'/'+item.slug};
+  }
   await q(`UPDATE explorations SET title=COALESCE($1,title),opening_question=COALESCE($2,opening_question),
     starting_view=COALESCE($3,starting_view),current_view=COALESCE($4,current_view),status='published',
     published_at=COALESCE(published_at,now()),updated_at=now() WHERE id=$5`,
@@ -264,7 +268,7 @@ function toolDefs() {
   const msg = {type:"object",properties:{role:{type:"string"},content:{type:"string"}},required:["content"]};
   return [
     {name:"create_exploration",description:"Create a PRIVATE draft exploration from the current AI-assisted thinking. Capture the human question, starting view, key turns, turning points and current view. Do not publish automatically.",inputSchema:{type:"object",properties:{title:{type:"string"},opening_question:{type:"string"},starting_view:{type:"string"},key_turns:{type:"array",items:{type:"string"}},turning_points:{type:"array",items:{type:"string"}},current_view:{type:"string"},source_platform:{type:"string"},source_model:{type:"string"},source_messages:{type:"array",items:msg}},required:["title"]}},
-    {name:"append_exploration",description:"Append new turns or a changed view to an existing private or published exploration.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"},key_turns:{type:"array",items:{type:"string"}},turning_points:{type:"array",items:{type:"string"}},current_view:{type:"string"},source_messages:{type:"array",items:msg}},required:["id_or_slug"]}},
+    {name:"append_exploration",description:"Create a new PRIVATE revision with additional turns or a changed view. The original stays unchanged. Use the returned id for subsequent calls.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"},key_turns:{type:"array",items:{type:"string"}},turning_points:{type:"array",items:{type:"string"}},current_view:{type:"string"},source_messages:{type:"array",items:msg}},required:["id_or_slug"]}},
     {name:"publish_exploration",description:"Make an exploration PUBLIC. Call only after the user explicitly asks to publish or share publicly.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"},title:{type:"string"},opening_question:{type:"string"},starting_view:{type:"string"},current_view:{type:"string"}},required:["id_or_slug"]}},
     {name:"get_exploration",description:"Get one of the authenticated creator's explorations and its optional source conversation.",inputSchema:{type:"object",properties:{id_or_slug:{type:"string"}},required:["id_or_slug"]}},
     {name:"list_my_explorations",description:"List the authenticated creator's recent drafts and published explorations.",inputSchema:{type:"object",properties:{}}},
