@@ -255,3 +255,28 @@ Settings support default instructions, default fork setup, a short paid BYOK con
 MCP `append_exploration` now returns a **new private revision ID**; use that returned ID for subsequent operations. Existing public snapshots cannot be overwritten through MCP publish. Additive database migrations run at startup; no new environment variables or external services are required. Existing `BYOK_MASTER_KEY` must remain unchanged; a missing master key still disables key storage and use.
 
 See [reference coverage and boundaries](docs/lagora-adaptation.md). Invited sharing is not a substitute for company administration, offboarding, or enterprise identity management.
+
+### 로그인·계정 관리
+
+- `/login`과 `/register`: 한글 로그인/회원가입, 비밀번호 확인, 안전한 앱 내부 복귀 경로.
+- `/account`: 비밀번호 변경, 복구 코드 발급, 로그아웃. 상단 메뉴와 설정에서도 접근할 수 있습니다.
+- `/account/recover`: 사전에 보관한 일회용 복구 코드와 아이디로 비밀번호 재설정. 코드는 무작위 192비트이며 DB에는 SHA-256 해시만 보관합니다. 발급 화면에서 한 번만 표시하고 재발급 시 기존 코드는 무효화합니다.
+- 비밀번호 변경/복구 시 모든 웹 세션, MCP OAuth 토큰·미사용 인가 코드 및 기존 레거시 토큰을 무효화합니다. 다시 로그인하고 필요한 AI 연결을 다시 승인하세요. 복구 코드도 새로 발급해야 합니다.
+- 현재 이메일을 수집·인증하지 않으므로 이메일 재설정은 지원하지 않습니다. 복구 코드를 미리 발급하지 않았고 비밀번호까지 잊으면 자동 복구할 수 없습니다.
+- 로그인/복구 등 계정 요청은 DB 기반 15분 단위 횟수 제한과 동일 출처 POST 검증을 적용합니다.
+
+#### Google 간편 로그인 (선택 설정)
+
+[Google 공식 OpenID Connect 문서](https://developers.google.com/identity/openid-connect/openid-connect)에 따라 Google Cloud에서 **웹 애플리케이션 OAuth 클라이언트**를 생성합니다. 동의 화면 설정과 테스트/게시 상태는 운영자가 관리해야 합니다.
+
+Railway `exploration-web`에 다음 변수를 넣으면 Google 버튼이 표시됩니다. 미설정 시 기존 아이디 로그인을 계속 사용할 수 있습니다.
+
+| 변수 | 값 |
+| --- | --- |
+| `GOOGLE_CLIENT_ID` | Google 웹 OAuth 클라이언트 ID |
+| `GOOGLE_CLIENT_SECRET` | 해당 클라이언트 secret (Railway에만 저장) |
+| `PUBLIC_BASE_URL` | `https://exploration-web-production.up.railway.app` (기존 값 유지) |
+
+Google에 등록할 승인된 리디렉션 URI는 **`https://exploration-web-production.up.railway.app/auth/google/callback`** 입니다. 도메인을 바꾸면 이 URI와 `PUBLIC_BASE_URL`을 함께 변경하세요.
+
+인증 코드는 서버에서 교환하며 브라우저에 묶인 일회용 state, 10분 만료, PKCE, nonce, Google 서명·발급자·audience·만료 검증을 사용합니다. 요청 범위는 `openid profile`입니다. 계정 식별은 이메일이 아닌 Google `sub`로 하며, 이름이 같아도 기존 아이디 계정과 자동 병합하지 않습니다. Google 가입 계정의 비밀번호 복구는 Google에서 관리합니다. Google OAuth 자격 증명이 없는 환경에서는 모의 공급자로 연동을 검증했으며, 운영 Google 로그인은 위 설정 후 별도 확인이 필요합니다.

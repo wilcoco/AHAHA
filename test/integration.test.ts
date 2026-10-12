@@ -293,7 +293,7 @@ test("real server preserves sign-in, OAuth PKCE, and private Exploration MCP wor
   });
   const crossSiteLogin = await fetch(origin + "/login", { method: "POST", headers: { origin: "https://attacker.invalid", "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ username, password }) });
   assert.equal(crossSiteLogin.status, 403);
-  const registered = await form("/register", { username, display_name: "Integration Test", password });
+  const registered = await form("/register", { username, display_name: "Integration Test", password, password_confirm: password });
   assert.equal(registered.status, 303);
   const login = await form("/login", { username, password });
   assert.equal(login.status, 303);
@@ -350,6 +350,37 @@ test("real server preserves sign-in, OAuth PKCE, and private Exploration MCP wor
   assert.notEqual(revision.id,exploration.id);assert.equal(revision.status,'draft');assert.equal(revision.parent_id,exploration.id);
   const original=(await rpc('tools/call',{name:'get_exploration',arguments:{id_or_slug:exploration.id}})).result.structuredContent.result;
   assert.equal(original.exploration.current_view,'');assert.equal(original.source_messages.length,0);
+  // Account recovery must revoke browser sessions and existing MCP credentials.
+  assert.match(await (await fetch(origin+'/login')).text(),/비밀번호를 잊으셨나요/);
+  const recoveryPage=await form('/account/recovery-code',{current_password:password},cookie);
+  assert.equal(recoveryPage.status,200);
+  const recoveryCode=(await recoveryPage.text()).match(/id="recovery-code">([^<]+)/)![1];
+  const stored=(await db.pool.query('SELECT recovery_hash FROM users WHERE username=$1',[username])).rows[0].recovery_hash;
+  assert.equal(stored,createHash('sha256').update(recoveryCode).digest('hex'));
+  assert.notEqual(stored,recoveryCode);
+  const newPassword=randomBytes(20).toString('hex');
+  const recovered=await form('/account/recover',{username,recovery_code:recoveryCode,password:newPassword,password_confirm:newPassword});
+  assert.equal(recovered.status,303);
+  assert.equal((await fetch(origin+'/api/llm/settings',{headers:{cookie}})).status,401);
+  assert.equal((await fetch(origin+'/mcp',{method:'POST',headers:{authorization:'Bearer '+tokens.access_token},body:'{}'})).status,401);
+  assert.equal((await form('/login',{username,password})).status,401);
+  assert.equal((await form('/account/recover',{username,recovery_code:recoveryCode,password:newPassword,password_confirm:newPassword})).status,400);
+  const fresh=await form('/login',{username,password:newPassword,next:'//attacker.invalid'});
+  assert.equal(fresh.headers.get('location'),'/chat');
+  const freshCookie=fresh.headers.get('set-cookie')!.split(';')[0];
+  const attack=await fetch(origin+'/logout',{method:'POST',headers:{origin:'https://attacker.invalid',cookie:freshCookie}});
+  assert.equal(attack.status,403);
+  assert.equal((await form('/account/password',{current_password:'wrong-pass',password:newPassword,password_confirm:newPassword},freshCookie)).status,401);
+  const changed=await form('/account/password',{current_password:newPassword,password,password_confirm:password},freshCookie);
+  assert.equal(changed.status,303);
+  assert.equal((await fetch(origin+'/api/llm/settings',{headers:{cookie:freshCookie}})).status,401);
+  const lastLogin=await form('/login',{username,password});
+  const lastCookie=lastLogin.headers.get('set-cookie')!.split(';')[0];
+  assert.equal((await form('/logout',{},lastCookie)).status,303);
+  assert.equal((await fetch(origin+'/api/llm/settings',{headers:{cookie:lastCookie}})).status,401);
+  for(let i=0;i<16;i++)await form('/login',{username:'unknown_account',password:'invalid-password'});
+  assert.equal((await form('/login',{username:'unknown_account',password:'invalid-password'})).status,429);
+
 });
 
 
